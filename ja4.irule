@@ -1,3 +1,13 @@
+###############################################################################################
+#  iRule to calculate JA4 "Client TLS"
+#  See JA4 spec on GitHub for more details
+#  https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
+#
+#  Created by Joe Martin - 7/11/2023
+#   Updated 4/4/2024
+###############################################################################################
+
+
 proc getCipherList { payload rlen outer inner clientip serverip } {
 
     upvar cipher_cnt cipher_cnt

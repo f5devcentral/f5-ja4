@@ -1,3 +1,12 @@
+###############################################################################################
+#  iRule to calculate JA4H "HTTP Request"
+#  See JA4H spec on GitHub for more details
+#  https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4H.md
+#
+#  Created by Joe Martin - 7/11/2023
+#   Updated 4/4/2024
+###############################################################################################
+
 when HTTP_REQUEST {
     set me [string range [string tolower [HTTP::method]] 0 1]
     set v [string map {"." ""} [HTTP::version]]
