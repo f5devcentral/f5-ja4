@@ -63,6 +63,5 @@ when HTTP_REQUEST {
     set ja4h_fp "${me}${v}${c}${r}${hc}${lang}_${trunc_hhash}_${trunc_chash}"
 
     HTTP::header insert "X-JA4H" $ja4h_fp
-    #log local0. "JA4H: ${ja4h_fp} Path: [HTTP::path] Count: $ja4hXpath_cnt"
     #log local0. "JA4H fingprint: ${ja4h_fp}"
 }
