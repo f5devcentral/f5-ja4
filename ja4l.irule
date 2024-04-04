@@ -59,7 +59,7 @@ when CLIENT_ACCEPTED {
     # Testing built-in [TCP::rtt] command compared to manual calculation of timestamps
     set rtt [TCP::rtt]
     set delay [expr (${rtt} * 31.25)/2]
-    log local0. "Calculated RTT: ${ja4l_tdiff} TCP::rtt: ${delay}  Difference: '[expr ${ja4l_tdiff} - ${delay}]'"
+    #log local0. "Calculated RTT: ${ja4l_tdiff} TCP::rtt: ${delay}  Difference: '[expr ${ja4l_tdiff} - ${delay}]'"
     # The [TCP::rtt] command returns the rtt as 1/32 of a ms for some reason (???),
     # so we need to multiply by 31.25 to get µs.
 
@@ -72,7 +72,7 @@ when CLIENT_ACCEPTED {
     # Calculate per hop delay
     set phdelay [expr ${ja4l_tdiff}/${hops}]
     # Log the IP, geoloc data, RTT delay, hop count, and per hop delay
-    log local0. "[IP::client_addr]|${region}, ${country} - ${ja4l_tdiff}us delay / ${hops} hops == ${phdelay}us/hop"
+    #log local0. "[IP::client_addr]|${region}, ${country} - ${ja4l_tdiff}us delay / ${hops} hops == ${phdelay}us/hop"
 
     # Using tables to track changes in JA4L per IP
     # Check if we already have a entry for this IP
