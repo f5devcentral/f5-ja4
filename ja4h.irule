@@ -1,0 +1,59 @@
+when HTTP_REQUEST {
+    set me [string range [string tolower [HTTP::method]] 0 1]
+    set v [string map {"." ""} [HTTP::version]]
+    set c "n"
+    set r "n"
+    if { [HTTP::header exists "cookie"] } {
+        set c "c"
+    }
+    if { [HTTP::header exists "referer"] } {
+        set r "r"
+    }
+    set lang "0000"
+    if { [set alval [HTTP::header value "accept-language"]] ne "" } {
+        if { $alval contains ";" } {
+            set alval [string range  $alval 0 [string first ";" $alval]]
+        }
+        set alval [string tolower [string range [string map {"-" ""} ${alval}] 0 3]]
+        set lang [string replace $lang 0 [string length ${alval}] ${alval}]
+    }
+
+    set hc 0
+    set hlist ""
+    foreach hname [HTTP::header names] {
+        if { ${hname} ne "cookie" } {
+            incr hc
+            append hlist "${hname},"
+        }
+    }
+    if { $hc > 99 } {
+        set hc 99
+    }
+    set hc [format "%02d" $hc]   
+    set hlist [string trimright ${hlist} ","]
+    binary scan [sha256 ${hlist}] H* hhash
+    set trunc_hhash [string range $hhash 0 11]
+
+
+    set clist ""
+    foreach cname [HTTP::cookie names] {
+        if { $cname matches_regex {(TS\d\d[a-z0-9]{6}\d{0,3}|TSPD_101(_DID)?)} } {
+            #ignoring ASM cookies
+        } else {
+            append clist "${cname},"
+        }
+    }
+    set clist [string trimright ${clist} ","]
+    if { $c eq "c" } {
+        binary scan [sha256 ${clist}] H* chash
+        set trunc_chash [string range $chash 0 11]
+    } else {
+        set trunc_chash "000000000000"
+    }
+
+    set ja4h_fp "${me}${v}${c}${r}${hc}${lang}_${trunc_hhash}_${trunc_chash}"
+
+    HTTP::header insert "X-JA4H" $ja4h_fp
+    #log local0. "JA4H: ${ja4h_fp} Path: [HTTP::path] Count: $ja4hXpath_cnt"
+    #log local0. "JA4H fingprint: ${ja4h_fp}"
+}
