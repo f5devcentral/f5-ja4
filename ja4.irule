@@ -1,0 +1,247 @@
+proc getCipherList { payload rlen outer inner clientip serverip } {
+
+    upvar cipher_cnt cipher_cnt
+
+    ## Define GREASE values so these can be excluded from cipher list
+    set greaseList "0a0a 1a1a 2a2a 3a3a 4a4a 5a5a 6a6a 7a7a 8a8a 9a9a aaaa baba caca dada eaea fafa"
+
+    ## Skip over first 43 bytes (contains tls_type hello_len tls_ver, which we don't need)
+    set field_offset 43
+
+    ## Grab the session ID length value and increment field_offset.
+    binary scan ${payload} @${field_offset}c sessID_len
+    set field_offset [expr {${field_offset} + 1 + ${sessID_len}}]
+
+    ## Grab ciphersuite list length (binary and hex values).
+    binary scan ${payload} @${field_offset}S cipherList_len
+    binary scan ${payload} @${field_offset}H4 cipherList_len_hex
+    set cipherList_len_hex_text ${cipherList_len_hex}
+
+    ## increment field_offset and get the ciphersuite list.
+    set field_offset [expr {${field_offset} + 2}]
+    set cipherList_len_hex [expr {${cipherList_len} * 2}]
+    binary scan ${payload} @${field_offset}H${cipherList_len_hex} cipherlist
+
+    ## Parse through cipherlist, add each non-GREASE cipher to cipherSuite list.
+    set cipher_cnt 0
+    set parsed_cl $cipherlist
+    set cipherSuite {}
+    set cl_offset 0
+    while {[scan $parsed_cl %4s%n cipherhex length] == 2} {
+        if { [lsearch -sorted -inline $greaseList $cipherhex] eq "" } {
+            lappend cipherSuite $cipherhex
+            incr cipher_cnt
+        } else {
+            #log local0. "CipherList: Found GREASE cipher '${cipherhex}'"
+        }
+        set parsed_cl [string range $parsed_cl $length end]
+    }
+    ## Sort cipherSuite list.
+    set cipherSuite [lsort $cipherSuite]
+    ## Convert list to string.
+    set cipher_list ""
+    foreach cipher_hex $cipherSuite {
+        append cipher_list "${cipher_hex},"
+    }
+
+    return $cipher_list
+
+}
+
+
+
+
+
+
+when CLIENT_ACCEPTED {
+    ## Collect the TCP payload
+    TCP::collect
+}
+when CLIENT_DATA {
+    ## Get the TLS packet type and versions
+    if { ! [info exists rlen] } {
+        binary scan [TCP::payload] cH4ScH6H4 rtype outer_sslver rlen hs_type rlen inner_sslver
+
+        if { ( ${rtype} == 22 ) and ( ${hs_type} == 1 ) } {
+            set cipher_list [call getCipherList [TCP::payload] ${rlen} ${outer_sslver} ${inner_sslver} [IP::client_addr] [IP::local_addr]]
+        }
+    }
+
+    # Collect the rest of the record if necessary
+    if { [TCP::payload length] < $rlen } {
+        TCP::collect $rlen
+    }
+
+    ## Release the payload
+    TCP::release
+}
+
+when CLIENTSSL_CLIENTHELLO {
+
+    ## Release the GREASE list so we can exclude these from the extensions list
+    set greaseList {0a0a 1a1a 2a2a 3a3a 4a4a 5a5a 6a6a 7a7a 8a8a 9a9a aaaa baba caca dada eaea fafa}
+
+    ## Get TCP/QUIC value for JA4
+    set ja4c_qt "t"
+    if { [SSL::extensions exists -type 39] } {
+        set ja4c_qt "q"
+    }
+
+    ## Get SNI value for JA4
+    set ja4c_sni "i"
+    if { [SSL::extensions exists -type 00] } {
+        set ja4c_sni "d"
+    }
+
+    ## Get count of ciphers and format it
+    ## (cipher_cnt is upvar'd from getCipherList proc)
+    set ja4c_ccnt $cipher_cnt
+    if { $ja4c_ccnt > 99 } {
+        set ja4c_ccnt 99
+    }
+    set ja4c_ccnt [format "%02d" $ja4c_ccnt]   
+
+    ## Hash and truncate cipher list
+    set cipher_list [string trimright ${cipher_list} ","]
+    binary scan [sha256 ${cipher_list}] H* cipher_hash
+    set trunc_cipher_hash [string range $cipher_hash 0 11]
+
+    ## Get count of extensions so we can iterate through ALL of them
+    set ext_count [SSL::extensions count]
+
+    ## Parse through extensions list and sort them, excluding GREASE extensions
+    set ja4c_ecnt 0
+    set ext_types {}
+    set ja4c_ver $inner_sslver
+    set ja4_alpn "00"
+    set sig_algo_list ""
+    for {set i 0} {$i<$ext_count} {incr i} {
+        binary scan [SSL::extensions -index $i] S1S1H* ext_type ext_len ext_val
+        binary scan [SSL::extensions -index $i] H4 ext_type_hex
+        if {[lsearch -sorted -inline $greaseList $ext_type_hex] ne "" } {
+            #log local0. "Found extension ${ext_type_hex}: Ignoring GREASE value.."
+        } else {
+            set ext_type [expr {$ext_type & 0xffff}]
+            set ext_len [expr {$ext_len & 0xffff}]
+
+            ## Parse 'Supported Versions' extension, append sver_list excluding GREASE values
+            if { ${ext_type} == "43" } {
+                #log local0. "Found extension ${ext_type_hex}: Parsing Supported Versions Extension.."
+                set ver_list {}
+                scan $ext_val %2x%s sver_len sver_list
+                while {[scan $sver_list %4s%n sver_hex length] == 2} {
+                    if { [lsearch -sorted -inline $greaseList $sver_hex] eq "" } {
+                        #log local0. "Supported Version ${sver_hex}: Adding to sver_list"
+                        lappend ver_list ${sver_hex}
+                    } else {
+                        #log local0. "Supported Version ${sver_hex}: Ignoring GREASE value"
+                    }
+                    set sver_list [string range $sver_list $length end]
+                }
+                ## Sort the 'Supported Versions' list and only keep the highest version
+                set ver_list [lsort $ver_list]
+                #log local0. "Sorted Supported Version List: ${ver_list}"
+                set ja4c_ver [lindex $ver_list end]
+                #log local0. "JA4c_ver: ${ja4c_ver}"
+
+                lappend ext_types ${ext_type_hex}
+                #log local0. "Appended ext types list: '${ext_types}'"
+                incr ja4c_ecnt
+                #log local0. "Incremented ext count to ${ja4c_ecnt}"
+
+            ## Parse Signature Algorithms extension to get sig_algo_list
+            } elseif { ${ext_type} == "13" } {
+                #log local0. "Found extension ${ext_type_hex}: Parsing Signature Algorithm Extension.."
+                regsub -all {[a-fA-F0-9]{4}} ${ext_val} {&,} sig_algo_list
+                set sig_algo_list [string trimright ${sig_algo_list} ","]
+                set sig_algo_list [string range ${sig_algo_list} 5 end]
+                #log local0. "sig_algo_list: '${sig_algo_list}'"
+                lappend ext_types ${ext_type_hex}
+                #log local0. "Appended ext types list: '${ext_types}'"
+                incr ja4c_ecnt
+                #log local0. "Incremented ext count to ${ja4c_ecnt}"
+
+            ## Parse 'ALPN' extension, to get first value, exclude from ext type list and count
+            } elseif { ${ext_type} == "16" } {
+                #log local0. "Found extension ${ext_type_hex}: Parsing ALPN Extension"
+                scan $ext_val %4x%s alpn_list_len alpn_list
+                scan $alpn_list %2x%s alpn_len alpn_list
+                set alpn_len [expr { ${alpn_len} * 2}]
+                scan $alpn_list %${alpn_len}s%s alpn_val alpn_list
+                set alpn_val [binary format H* $alpn_val]
+                #log local0. "ALPN Value: '${alpn_val}'"
+                if { [string length ${alpn_val}] > 2 } {
+                    set ja4_alpn "[string range ${alpn_val} 0 0][string range ${alpn_val} end end]"
+                } else {
+                    set ja4_alpn ${alpn_val}
+                }
+                #log local0. "JA4 ALPN: '${ja4_alpn}'"
+                incr ja4c_ecnt
+                #log local0. "Incremented ext count to ${ja4c_ecnt}"
+            ## Exclude SNI extension from ext type list and count 
+            } elseif { ${ext_type} == "00" } {
+                #log local0. "Found extension ${ext_type_hex}: SNI already handled"
+                incr ja4c_ecnt
+                #log local0. "Incremented ext count to ${ja4c_ecnt}"
+            } else {
+                #log local0. "Found extension ${ext_type_hex}: Appending ext list"
+                lappend ext_types ${ext_type_hex}
+                #log local0. "Appended ext types list: '${ext_types}'"
+                incr ja4c_ecnt
+                #log local0. "Incremented ext count to ${ja4c_ecnt}"
+            }
+        }
+
+    }
+
+    ## Format extensions count var
+    if { $ja4c_ecnt > 99 } {
+        #log local0. "Ext count is  > 99, setting to 99"
+        set ja4c_ecnt 99
+    }
+    set ja4c_ecnt [format "%02d" $ja4c_ecnt]
+
+    ## Sort and format extensions type list
+    set ext_types [lsort $ext_types]
+    set ext_type_list ""
+    foreach ext_type_hex $ext_types {
+        append ext_type_list "${ext_type_hex},"
+    }
+    set ext_type_list [string trimright ${ext_type_list} ","]
+    #log local0. "sorted ext_type_list: '${ext_type_list}'"
+    ## if it exists, append signature algorithms list to end of ext_type_list string
+    if { ${sig_algo_list} ne "" } {
+        set ext_type_list "${ext_type_list}_${sig_algo_list}"
+    }
+    #log local0. "full ext_type_list: '${ext_type_list}'"
+    binary scan [sha256 ${ext_type_list}] H* ext_type_hash
+    #log local0. "hashed ext_type_list: '${ext_type_hash}'"
+    set trunc_ext_type_hash [string range $ext_type_hash 0 11]
+    #log local0. "JA4_c ext_type_list: '${trunc_ext_type_hash}'"
+
+    ## Format version
+    switch $ja4c_ver {
+        0304 { set ja4c_ver "13" }
+        0303 { set ja4c_ver "12" }
+        0302 { set ja4c_ver "11" }
+        0301 { set ja4c_ver "10" }
+        0300 { set ja4c_ver "s3" }
+        0200 { set ja4c_ver "s2" }
+        0100 { set ja4c_ver "s1" }
+    }
+
+    set ja4_fp "${ja4c_qt}${ja4c_ver}${ja4c_sni}${ja4c_ccnt}${ja4c_ecnt}${ja4_alpn}_${trunc_cipher_hash}_${trunc_ext_type_hash}"
+    set ja4_r_fp "${ja4c_qt}${ja4c_ver}${ja4c_sni}${ja4c_ccnt}${ja4c_ecnt}${ja4_alpn}_${cipher_list}_${ext_type_list}"
+
+    #log local0. "JA4TC FINGERPRINT -- $ja4_fp -- JA4TC FINGERPRINT"
+
+}
+
+when HTTP_REQUEST {
+    if { [info exists ja4_fp] } {
+        HTTP::header insert "X-JA4" ${ja4_fp}
+    }
+    if { [info exists ja4_r_fp] } {
+        HTTP::header insert "X-JA4-R" ${ja4_r_fp}
+    }
+}
