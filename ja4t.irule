@@ -1,0 +1,37 @@
+###############################################################################################
+#  iRule to calculate JA4 "Client TLS"
+#  See JA4 spec on GitHub for more details
+#  https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
+#
+#  Created by Joe Martin - 4/5/2024
+#
+###############################################################################################
+
+when FLOW_INIT {
+    set recv_win [DATAGRAM::tcp window]
+    set ops_list ""
+    foreach option [DATAGRAM::tcp option] {
+        scan ${option} "%s%s" kind value
+        switch ${kind} {
+            "2" {
+                binary scan ${value} S* mss
+            }
+            "3" {
+                binary scan ${value} c* win_scale
+            }
+        }
+        append ops_list "${kind}-"
+        unset -nocomplain kind
+        unset -nocomplain value
+    }
+    set ops_list [string trimright ${ops_list} "-"]
+
+    set ja4t "${recv_win}_${ops_list}_${mss}_${win_scale}"
+    #log local0. "JA4T: '${ja4t}'"
+}
+
+when HTTP_REQUEST {
+    if {[info exists ja4t]}{
+        HTTP::header insert "JA4T" ${ja4t}
+    }
+}
