@@ -20,6 +20,9 @@ when FLOW_INIT {
                 binary scan ${value} c* win_scale
             }
         }
+        if {![info exists win_scale]}{
+            set win_scale "0"
+        }
         append ops_list "${kind}-"
         unset -nocomplain kind
         unset -nocomplain value
