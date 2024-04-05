@@ -7,105 +7,40 @@
 #   Updated 1/12/2024
 ###############################################################################################
 
-when RULE_INIT {
-    # Set ja4l_use_metric to 1 if you would like the calculated distance in kilometers instead of miles
-    set static::ja4l_use_metric 0
-}
 when FLOW_INIT {
     #Set timestamp for initial received SYN
     set ja4l_ts1 [clock clicks]
+    #log local0. "ja4l_ts1: ${ja4l_ts1}"
 }
 
 when CLIENT_ACCEPTED {
     #Set timestamp for final received SYN/ACK
     set ja4l_ts2 [clock clicks]
+    #log local0. "ja4l_ts2: ${ja4l_ts2}"
 
     #Calculate time difference - (ts2-ts1)/2
-    set ja4l_tdiff [expr ($ja4l_ts2 - $ja4l_ts1)/2]
+    set ja4l_tcp_latency [expr ($ja4l_ts2 - $ja4l_ts1)/2]
 
-    # Get hop count
-    set hops [IP::hops]
+    # Get IP TTL
+    set ttl [IP::ttl]
     # NOTE: The [IP::hops] iRule command already calculates hop count according to the JA4L specification
+    
+    TCP::collect
 
-    # Get propagation delay factor - see JA4L spec for more details
-    switch $hops {
-        "22" { set prop_delay "1.6" }
-        "23" { set prop_delay "1.7" }
-        "24" { set prop_delay "1.8" }
-        "25" { set prop_delay "1.9" }
-        default {
-            if { $hops <= 21 }{ set prop_delay "1.5" }
-            else { set prop_delay "2.0" }
-        }
-    }
+}
 
-    # Set per µs distance and unit of measurement
-    # Speed of light per µs in fiber (0.128 miles/µs or 0.206km/µs)
-    set cdist "0.128"
-    set dist_unit "miles"
-    if {$static::ja4l_use_metric}{
-        set cdist "0.206"
-        set dist_unit "km"
-    }
-
-    # Calculate "light distance"
-    set ja4l_dist [expr int((${ja4l_tdiff} * 0.128) / ${prop_delay})]
-
-    # NOTE: The JA4L value is injected as an HTTP request header below in the HTTP_REQUEST event
-
-    ###############################################################################################
-    ##########  THIS SECTION IS SUPERFLUOUS TO JA4L SPEC - CAN BE REMOVED OR IGNORED ##############
-
-    # Testing built-in [TCP::rtt] command compared to manual calculation of timestamps
-    set rtt [TCP::rtt]
-    set delay [expr (${rtt} * 31.25)/2]
-    #log local0. "Calculated RTT: ${ja4l_tdiff} TCP::rtt: ${delay}  Difference: '[expr ${ja4l_tdiff} - ${delay}]'"
-    # The [TCP::rtt] command returns the rtt as 1/32 of a ms for some reason (???),
-    # so we need to multiply by 31.25 to get µs.
-
-
-    # Get country and state/region from local geolocation DB.
-    set country [whereis [IP::client_addr] country]
-    set region [whereis [IP::client_addr] state]
-
-    # Tracking per hop delay over time to see if a more accurate propagation delay factor is possible
-    # Calculate per hop delay
-    set phdelay [expr ${ja4l_tdiff}/${hops}]
-    # Log the IP, geoloc data, RTT delay, hop count, and per hop delay
-    #log local0. "[IP::client_addr]|${region}, ${country} - ${ja4l_tdiff}us delay / ${hops} hops == ${phdelay}us/hop"
-
-    # Using tables to track changes in JA4L per IP
-    # Check if we already have a entry for this IP
-    if {[set ld_entry [table lookup [IP::client_addr]]] eq "" }{
-        #No entry for this IP so add table entry with IP, JA4L, and 5 min timeout/lifetime 
-        table set [IP::client_addr] "${ja4l_dist}:1" 300 300
-        #log local0. "JA4L: [IP::client_addr] - New light distance ${ja4l_dist}m."
-        set ld_avg "0"
-    } else {
-        #Table entry exists for this IP so calculate difference between current value and the average
-        scan $ld_entry {%[^:]:%s} ld_avg ld_cnt
-        #log local0. "ld_avg: ${ld_avg} ld_cnt: ${ld_cnt}"
-        set ld_diff [expr {${ja4l_dist} - ${ld_avg}}]
-        set ld_diff [expr {abs($ld_diff)}]
-        # Now check if the difference is greater than 50% of the average
-        if { $ld_diff > [expr {$ld_avg * 0.5}]}{
-            # greater than 50% difference from averge, do something
-            #log local0. "JA4L: [IP::client_addr] - Light distance ${ja4l_dist}m > 150% of AVG ${ld_avg}m."
-        } else {
-            # No significant deviation from average, increment count and calculate new average
-            incr ld_cnt
-            set ld_avg [expr {${ld_avg} + ((${ja4l_dist} - ${ld_avg})/${ld_cnt})}]
-            #log local0. "JA4L: [IP::client_addr] - Light distance AVG ${ld_avg}m."
-            # update table with new average:count
-            table set [IP::client_addr] ${ld_avg}:${ld_cnt} 300 300
-        }
-    }
-    ##########  THIS SECTION IS SUPERFLUOUS TO JA4L SPEC - CAN BE REMOVED OR IGNORED ##############
-    ###############################################################################################
+when CLIENT_DATA {
+    # Set timestamp for inital "application" data
+    set ja4l_ts3 [clock clicks]
+    #log local0. "ja4l_ts3: ${ja4l_ts3}"
+    # Calculate "application latency"
+    set ja4l_app_latency [expr $ja4l_ts3 - $ja4l_ts2]
+    
+    # Defone JA4L string
+    set ja4l "${ja4l_tcp_latency}_${ttl}_${ja4l_app_latency}"
 }
 
 when HTTP_REQUEST {
 
-    HTTP::header insert "X-JA4L-DISTANCE" "${ja4l_dist} ${dist_unit}"
-    #HTTP::header insert "X-JA4L-AVG" $ld_avg
+    HTTP::header insert "X-JA4L" "${ja4l}"
 }
