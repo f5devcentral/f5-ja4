@@ -1,6 +1,6 @@
 # F5 iRules for JA4+ Network Fingerprinting
 
-This repo includes iRules for generating JA4+ fingerprints.  Currently, only JA4, JA4L, and JA4H fingerprint iRules are provided.  More JA4+ fingerprint iRules *MAY* be added in the future.
+This repo includes iRules for generating JA4+ fingerprints.  Currently, only JA4, JA4T, JA4L, and JA4H fingerprint iRules are provided.  More JA4+ fingerprint iRules *MAY* be added in the future.
 
 > [!WARNING]
 >DISCLAIMER: These iRules are provided as-is with no guarantee of performance or functionality.  Use at your own risk.
