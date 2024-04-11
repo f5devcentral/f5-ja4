@@ -9,7 +9,16 @@
 #  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
 ###############################################################################################
 
+when CLIENT_ACCEPTED {
+    # Use these variables to define the -r (raw) and -o (original) switches defined in the JA4 spec
+    # 0 = false/disabled (default) and 1 = true/enabled
+    set ja4h_raw 0
+    set ja4h_original 0
+
+}
+
 when HTTP_REQUEST {
+    #Collect JA4H "a" values
     set me [string range [string tolower [HTTP::method]] 0 1]
     set v [string map {"." ""} [HTTP::version]]
     set c "n"
@@ -28,42 +37,82 @@ when HTTP_REQUEST {
         set alval [string tolower [string range [string map {"-" ""} ${alval}] 0 3]]
         set lang [string replace $lang 0 [string length ${alval}] ${alval}]
     }
-
+    
+    #Collect JA4H "b" values
     set hc 0
-    set hlist ""
+    set hstr ""
+    set hlist [list]
     foreach hname [HTTP::header names] {
-        if { ${hname} ne "cookie" } {
+        if { ${hname} eq "cookie" || ${hname} eq "referer"} {
+            if {${ja4h_original}}{
+                lappend hlist "${hname}"
+            }
+        } else {
             incr hc
-            append hlist "${hname},"
+            lappend hlist "${hname}"
         }
+    }
+    if {${ja4h_original} == 0 }{
+        set hlist [lsort ${hlist}]
+    }
+    foreach h ${hlist} {
+        append hstr "${h},"
     }
     if { $hc > 99 } {
         set hc 99
     }
     set hc [format "%02d" $hc]   
-    set hlist [string trimright ${hlist} ","]
-    binary scan [sha256 ${hlist}] H* hhash
+    set hstr [string trimright ${hstr} ","]
+    binary scan [sha256 ${hstr}] H* hhash
     set trunc_hhash [string range $hhash 0 11]
 
-
-    set clist ""
+    #Collect JA4H "c" and "d" values
+    set cstr ""
+    set clist [list]
+    set ckvstr ""
+    set ckvlist ""
     foreach cname [HTTP::cookie names] {
-        if { $cname matches_regex {(TS\d\d[a-z0-9]{6}\d{0,3}|TSPD_101(_DID)?)} } {
-            #ignoring ASM cookies
+        if { ${cname} matches_regex {(TS\d\d[a-z0-9]{6}\d{0,3}|TSPD_101(_DID)?)} } {
+            #ignoring F5 ASM cookies
         } else {
-            append clist "${cname},"
+            lappend clist ${cname}
+            lappend ckvlist "${cname}=[HTTP::cookie value ${cname}]"
         }
     }
-    set clist [string trimright ${clist} ","]
+    if {${ja4h_original} == 0 }{
+        set clist [lsort ${clist}]
+        set ckvlist [lsort ${ckvlist}]
+    }
+    foreach ck ${clist} {
+        append cstr "${ck},"
+    }
+    foreach ckv ${ckvlist} {
+        append ckvstr "${ckv},"
+    }
+        
+    set cstr [string trimright ${cstr} ","]
+    set ckvstr [string trimright ${ckvstr} ","]
     if { $c eq "c" } {
-        binary scan [sha256 ${clist}] H* chash
+        binary scan [sha256 ${cstr}] H* chash
+        binary scan [sha256 ${ckvstr}] H* ckvhash
         set trunc_chash [string range $chash 0 11]
+        set trunc_ckvhash [string range $ckvhash 0 11]
     } else {
         set trunc_chash "000000000000"
+        set trunc_ckvhash "000000000000"
     }
 
-    set ja4h_fp "${me}${v}${c}${r}${hc}${lang}_${trunc_hhash}_${trunc_chash}"
-
+    # Generate JA4H fingerprint string
+    set ja4h_fp "${me}${v}${c}${r}${hc}${lang}_${trunc_hhash}_${trunc_chash}_${trunc_ckvhash}"
     HTTP::header insert "X-JA4H" $ja4h_fp
-    #log local0. "JA4H fingprint: ${ja4h_fp}"
+
+    # If enabled, Generate JA4H_r(o) fingerprint string
+    if { ${ja4h_raw} } {
+        set ja4hr_fp "${me}${v}${c}${r}${hc}${lang}_${hstr}_${cstr}_${ckvstr}"
+        set ja4h_xhdr "X-JA4H_r"
+        if { ${ja4h_original} } {
+            set ja4h_xhdr "X-JA4H_ro"
+        }
+        HTTP::header insert ${ja4h_xhdr} ${ja4hr_fp}
+    }
 }
