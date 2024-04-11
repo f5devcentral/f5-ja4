@@ -14,4 +14,16 @@ Please read this blog post for more details: [JA4+ Network Fingerprinting](https
 
 To understand how to read JA4+ fingerprints, see [Technical Details](https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/README.md)
 
- 
+> [!IMPORTANT]
+>**JA4 TLS Client Fingerprinting is licensed under BSD 3-Clause**
+>_Copyright (c) 2024, FoxIO_
+>_All rights reserved._
+>_JA4 TLS Client Fingerprinting is Open-Source, Licensed under BSD 3-Clause_
+>_For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4_
+>
+>**All other JA4+ Fingerprints are under the FoxIO License 1.1**
+>_Copyright (c) 2024, FoxIO, LLC._
+>_All rights reserved._
+>_Licensed under FoxIO License 1.1_
+>_For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4_
+
