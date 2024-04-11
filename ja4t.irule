@@ -3,8 +3,10 @@
 #  See JA4 spec on GitHub for more details
 #  https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
 #
-#  Created by Joe Martin - 4/5/2024
-#
+#  Copyright (c) 2024, FoxIO, LLC.
+#  All rights reserved.
+#  Licensed under FoxIO License 1.1
+#  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
 ###############################################################################################
 
 when FLOW_INIT {
