@@ -12,12 +12,12 @@
 when CLIENT_ACCEPTED {
     # Use these variables to define the -r (raw) and -o (original) switches defined in the JA4 spec
     # 0 = false/disabled (default) and 1 = true/enabled
-    set ja4h_raw 0
+    set ja4h_raw 1
     set ja4h_original 0
 
 }
 
-when HTTP_REQUEST {
+when HTTP_REQUEST priority 10 {
     #Collect JA4H "a" values
     set me [string range [string tolower [HTTP::method]] 0 1]
     set v [string map {"." ""} [HTTP::version]]
@@ -41,23 +41,19 @@ when HTTP_REQUEST {
     #Collect JA4H "b" values
     set hc 0
     set hstr ""
-    set hlist [list]
     foreach hname [HTTP::header names] {
-        if { ${hname} eq "cookie" || ${hname} eq "referer"} {
-            if {${ja4h_original}}{
-                lappend hlist "${hname}"
+        if { ${hname} starts_with "X-JA4" } {
+            continue
+        } elseif { ([string tolower ${hname}] eq "cookie") || ([string tolower ${hname}] eq "referer")} {
+            if { ${ja4h_original} }{
+                append hstr "${hname},"
             }
         } else {
             incr hc
-            lappend hlist "${hname}"
+            append hstr "${hname},"
         }
     }
-    if {${ja4h_original} == 0 }{
-        set hlist [lsort ${hlist}]
-    }
-    foreach h ${hlist} {
-        append hstr "${h},"
-    }
+
     if { $hc > 99 } {
         set hc 99
     }
@@ -70,24 +66,16 @@ when HTTP_REQUEST {
     set cstr ""
     set clist [list]
     set ckvstr ""
-    set ckvlist ""
+    #set ckvlist [list]
     foreach cname [HTTP::cookie names] {
-        if { ${cname} matches_regex {(TS\d\d[a-z0-9]{6}\d{0,3}|TSPD_101(_DID)?)} } {
-            #ignoring F5 ASM cookies
-        } else {
-            lappend clist ${cname}
-            lappend ckvlist "${cname}=[HTTP::cookie value ${cname}]"
-        }
+        lappend clist ${cname}
     }
     if {${ja4h_original} == 0 }{
         set clist [lsort ${clist}]
-        set ckvlist [lsort ${ckvlist}]
     }
     foreach ck ${clist} {
         append cstr "${ck},"
-    }
-    foreach ckv ${ckvlist} {
-        append ckvstr "${ckv},"
+        append ckvstr "${ck}=[HTTP::cookie value ${ck}],"
     }
         
     set cstr [string trimright ${cstr} ","]
