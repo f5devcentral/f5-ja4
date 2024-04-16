@@ -25,24 +25,25 @@ when CLIENT_ACCEPTED {
 
     # Get IP TTL
     set ttl [IP::ttl]
-    # NOTE: The [IP::hops] iRule command already calculates hop count according to the JA4L specification
-    
-    TCP::collect
 
 }
 
-when CLIENT_DATA {
-    # Set timestamp for inital "application" data
+when CLIENTSSL_CLIENTHELLO {
     set ja4l_ts3 [clock clicks]
-    #log local0. "ja4l_ts3: ${ja4l_ts3}"
+}
+
+when CLIENTSSL_HANDSHAKE {
+    set ja4l_ts4 [clock clicks]
     # Calculate "application latency"
-    set ja4l_app_latency [expr $ja4l_ts3 - $ja4l_ts2]
+    set ja4l_app_latency [expr ($ja4l_ts4 - $ja4l_ts3)/2]
     
     # Defone JA4L string
     set ja4l "${ja4l_tcp_latency}_${ttl}_${ja4l_app_latency}"
+    
 }
 
 when HTTP_REQUEST {
-
-    HTTP::header insert "X-JA4L" "${ja4l}"
+    if { [info exists ja4l] } {
+        HTTP::header insert "X-JA4L" "${ja4l}"
+    }
 }
