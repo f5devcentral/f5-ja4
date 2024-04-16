@@ -13,30 +13,36 @@ when FLOW_INIT {
     set recv_win [DATAGRAM::tcp window]
     set ops_list ""
     foreach option [DATAGRAM::tcp option] {
-        scan ${option} "%s%s" kind value
+        scan ${option} "%s %\[^-\]" kind value
         switch ${kind} {
             "2" {
                 binary scan ${value} S* mss
             }
             "3" {
                 binary scan ${value} c* win_scale
+                regexp {(?:123 )?(.*?)(?: 125)?} ${win_scale} match win_scale
             }
-        }
-        if {![info exists win_scale]}{
-            set win_scale "0"
         }
         append ops_list "${kind}-"
         unset -nocomplain kind
         unset -nocomplain value
     }
     set ops_list [string trimright ${ops_list} "-"]
+    if { ${ops_list} eq "" } {
+        set ops_list "00"
+    }
+    if {![info exists win_scale]}{
+            set win_scale "00"
+        }
+    if {![info exists mss]}{
+        set mss "00"
+    }
 
     set ja4t "${recv_win}_${ops_list}_${mss}_${win_scale}"
-    #log local0. "JA4T: '${ja4t}'"
 }
 
 when HTTP_REQUEST {
     if {[info exists ja4t]}{
-        HTTP::header insert "JA4T" ${ja4t}
+        HTTP::header insert "X-JA4T" ${ja4t}
     }
 }
