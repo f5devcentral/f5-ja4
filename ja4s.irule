@@ -1,0 +1,157 @@
+###############################################################################################
+#  iRule to calculate JA4S "Server TLS Fingerprint"
+#  See JA4 spec on GitHub for more details
+#  https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
+#
+#  Copyright (c) 2024, FoxIO, LLC.
+#  All rights reserved.
+#  Licensed under FoxIO License 1.1
+#  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
+###############################################################################################
+
+proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
+
+    ## HEADERS - SKIP: Already captured in XXX_DATA event (record header, handshake header, server version, server random)
+    set field_offset 43
+
+    ## SESSION ID - SKIP
+    binary scan ${payload} @${field_offset}c sessID_len
+    set field_offset [expr {${field_offset} + 1 + ${sessID_len}}]
+    
+    ## SERVER CIPHER
+    binary scan ${payload} @${field_offset}H4 ja4s_cipher
+    set field_offset [expr ${field_offset} + 2]
+    
+    ## COMPRESSION METHOD - SKIP
+    set field_offset [expr {${field_offset} + 1}]
+
+    ## EXTENSIONS 
+    set ja4s_ecnt 0
+    set ja4s_etype_list [list]
+    set ja4s_alpn "00"
+    
+    if { [expr {${field_offset} < ${rlen}}] } {
+        ## Extensions length - SKIP
+        set field_offset [expr {${field_offset} + 2}]
+
+        ## Pad rlen by 1 byte
+        set rlen [expr ${rlen} + 1]
+
+        ## Parse Extensions
+        while { [expr {${field_offset} <= ${rlen}}] } {
+            ## Capture Ext Type, Append to Ext List, Incr Ext Count, Incr offset past Ext Type
+            binary scan ${payload} @${field_offset}H4 ext
+            lappend ja4s_etype_list ${ext}
+            incr ja4s_ecnt
+            set field_offset [expr {${field_offset} + 2}]
+
+            ## Capture Ext Length, Incr offset past Ext Length
+            binary scan ${payload} @${field_offset}S ext_len
+            set field_offset [expr {${field_offset} + 2}]
+
+            ## Check for specific Extension Types
+            switch $ext {
+                "0010" {
+                    ## ALPN (16)
+                    ## Capture APLN length and ALPN string length
+                    binary scan ${payload} @${field_offset}Sc alpn_len alpn_str_len
+                    ## Capture the APLN string value
+                    binary scan ${payload} @[expr {${field_offset} + 3}]a${alpn_str_len} alpn_str
+                }
+                "0027" {
+                    ## Supported EKT Ciphers (39)
+                    ## Set JA4S Transport Protocol as QUIC
+                    set ja4s_tprt "q"
+                }
+                "002b" {
+                    ## Supported Versions (43)
+                    ## Capture Server-Selected Supported Version
+                    binary scan ${payload} @[expr {${field_offset} + 2}]H[expr {(${ext_len} - 2) * 2}] ja4s_ver
+                }
+            }
+            
+            #log local0. "SERVER_HELLO - EXT: ${ext} LEN: ${ext_len} VAL: ${ext_data}"
+            
+            ## Incr offset past the extension data length. Repeat this loop until we reach rlen (the end of the payload)
+            set field_offset [expr {${field_offset} + ${ext_len}}]
+        }
+    }
+    
+    if { [info exist alpn_str] } {
+        set ja4s_alpn "[string index ${alpn_str} 0][string index ${alpn_str} end]"
+    }
+    
+    ## Format extensions count var
+    if { $ja4s_ecnt > 99 } {
+        #log local0. "Ext count is  > 99, setting to 99"
+        set ja4s_ecnt 99
+    }
+    set ja4s_ecnt [format "%02d" $ja4s_ecnt]
+    
+    ## Sort and format extensions type list
+    set ja4s_etype_list [lsort $ja4s_etype_list]
+    set ja4s_etype_str ""
+    foreach ext_type_hex $ja4s_etype_list {
+        append ja4s_etype_str "${ext_type_hex},"
+    }
+    set ja4s_etype_str [string trimright ${ja4s_etype_str} ","]
+    binary scan [sha256 ${ja4s_etype_str}] H* ja4s_ext_hash
+    set ja4s_ext_hash_trunc [string range ${ja4s_ext_hash} 0 11]
+    
+    ## Format version
+    switch $ja4s_ver {
+        0304 { set ja4s_ver "13" }
+        0303 { set ja4s_ver "12" }
+        0302 { set ja4s_ver "11" }
+        0301 { set ja4s_ver "10" }
+        0300 { set ja4s_ver "s3" }
+        0200 { set ja4s_ver "s2" }
+        0100 { set ja4s_ver "s1" }
+    }
+    
+    #JA4S Algorithm:  
+    #(q or t)  
+    #(2 character tls version)  
+    #(2 character number of extensions)  
+    #(first and last character of the ALPN chosen)  
+    #_  
+    #(cipher suite chosen in hex)  
+    #_  
+    #(truncated sha256 hash of the extensions in the order that they appear)
+    
+    set ja4s_str "${ja4s_tprt}${ja4s_ver}${ja4s_ecnt}${ja4s_alpn}_${ja4s_cipher}_${ja4s_ext_hash_trunc}"
+    
+    return "${ja4s_str}"
+}
+
+
+when SERVER_CONNECTED {
+    unset -nocomplain rlen
+    set ja4s_tprt "t"
+    ## Collect the TCP payload
+    TCP::collect
+}
+
+when SERVER_DATA {
+    
+    ## Get the TLS packet type and versions
+    if { ! [info exists rlen] } {
+        binary scan [TCP::payload] cH4ScH6H4 rtype proto_ver rlen hs_type rilen server_ver
+        log local0. "rtype ${rtype} proto_ver ${proto_ver} rlen ${rlen} hs_type ${hs_type} rilen ${rilen} server_ver ${server_ver}"
+        
+        if { ( ${rtype} == 22 ) and ( ${hs_type} == 2 ) } {
+            log local0. "Found SERVER_HELLO"
+            set ja4s [call parseServerHello [TCP::payload] ${rlen} ${server_ver} ${ja4s_tprt}]
+            log local0. "JA4S: '${ja4s}'"
+            
+        }
+    }
+
+    # Collect the rest of the record if necessary
+    if { [TCP::payload length] < $rlen } {
+        TCP::collect $rlen
+    }
+
+    ## Release the payload
+    TCP::release
+}
