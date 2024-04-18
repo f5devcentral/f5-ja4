@@ -1,5 +1,5 @@
 ###############################################################################################
-#  iRule to calculate JA4 "Client TLS"
+#  iRule to calculate JA4T "TCP Fingerprint"
 #  See JA4 spec on GitHub for more details
 #  https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
 #
@@ -10,6 +10,14 @@
 ###############################################################################################
 
 when FLOW_INIT {
+    # To block based on a list of "bad" JA4T values, set "ja4t_blocking" to 1 (one) and
+    # set the name of your JA4T blocklist data group
+    set ja4t_blocking 0
+    set ja4t_blocklist "dg_ja4t_blocklist"
+    set ja4t_log_blocks 1
+    
+    
+    
     set recv_win [DATAGRAM::tcp window]
     set ops_list ""
     foreach option [DATAGRAM::tcp option] {
@@ -39,6 +47,17 @@ when FLOW_INIT {
     }
 
     set ja4t "${recv_win}_${ops_list}_${mss}_${win_scale}"
+    
+    if { ${ja4t_blocking} } {
+        if { [class exists ${ja4t_blocklist}] } {
+            if { [set blocked_ja4t [class match -element ${ja4t} equals ${ja4t_blocklist}]] ne "" } {
+                if { ${ja4t_log_blocks} } { log local0. "Dropping connection from JA4T: '${blocked_ja4t}'" }
+                drop
+            }
+        } else {
+            log local0. "JA4T blocking is enabled but data group '${ja4t_blocklist}' does not exist.  Create data group to enable blocking."
+        }
+    }
 }
 
 when HTTP_REQUEST {
