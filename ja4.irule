@@ -72,7 +72,7 @@ when CLIENT_ACCEPTED {
 when CLIENT_DATA {
     ## Get the TLS packet type and versions
     if { ! [info exists rlen] } {
-        binary scan [TCP::payload] cH4ScH6H4 rtype outer_sslver rlen hs_type rlen inner_sslver
+        binary scan [TCP::payload] cH4ScH6H4 rtype outer_sslver rlen hs_type rilen inner_sslver
 
         if { ( ${rtype} == 22 ) and ( ${hs_type} == 1 ) } {
             set cipher_list [call getCipherList [TCP::payload] ${rlen} ${outer_sslver} ${inner_sslver} [IP::client_addr] [IP::local_addr]]
@@ -254,6 +254,6 @@ when HTTP_REQUEST {
         HTTP::header insert "X-JA4" ${ja4_fp}
     }
     if { [info exists ja4_r_fp] } {
-        HTTP::header insert "X-JA4-R" ${ja4_r_fp}
+        HTTP::header insert "X-JA4_r" ${ja4_r_fp}
     }
 }
