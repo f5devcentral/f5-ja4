@@ -38,5 +38,5 @@ To understand how to read JA4+ fingerprints, see [Technical Details](https://git
 ## How to Use
 
 > Copy the iRules from this folder.
-> Add iRule event trigger in your Access Policy.
+> Add iRule event trigger in your Access Policy, take care of the trigger ID in the iRule. 
 > In case you try to query external JA4db website, you can utilize HTTP connector to make use of the obtained parameters.
