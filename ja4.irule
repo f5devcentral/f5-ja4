@@ -105,7 +105,7 @@ proc parseClientHello { payload rlen ja4_ver ja4_tprt } {
                         ## Capture Signature Algorithms length
                         binary scan ${payload} @${field_offset}S siga_len
                         set siga_offset 0
-                        while { [expr {${siga_offset} <= ${siga_len}}] } {
+                        while { [expr {${siga_offset} < ${siga_len}}] } {
                             binary scan ${payload} @[expr {${field_offset} + 2 + ${siga_offset}}]H4 siga_hex
                             if { [lsearch -sorted -inline $greaseList $siga_hex] eq "" } {
                                 append siga_list "${siga_hex},"
