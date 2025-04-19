@@ -208,6 +208,7 @@ proc parseClientHello { payload rlen ja4_ver ja4_tprt } {
 when CLIENT_ACCEPTED {
     unset -nocomplain rlen
     set ja4_tprt "t"
+    set clienthello_payload ""
     ## Collect the TCP payload
     TCP::collect
 }
@@ -218,18 +219,19 @@ when CLIENT_DATA {
     if { ! [info exists rlen] } {
         binary scan [TCP::payload] cH4ScH6H4 rtype proto_ver rlen hs_type rilen server_ver
         #log local0. "rtype ${rtype} proto_ver ${proto_ver} rlen ${rlen} hs_type ${hs_type} rilen ${rilen} server_ver ${server_ver}"
-        
-        if { ( ${rtype} == 22 ) and ( ${hs_type} == 1 ) } {
-            #log local0. "Found CLIENT_HELLO"
-            set ja4 [call parseClientHello [TCP::payload] ${rlen} ${server_ver} ${ja4_tprt}]
-            #log local0. "JA4: '${ja4}'"
-            
-        }
     }
 
-    # Collect the rest of the record if necessary
-    if { [TCP::payload length] < $rlen } {
-        TCP::collect $rlen
+    ## Collect the rest of the record if necessary
+    if { ( ${rtype} == 22 ) and ( ${hs_type} == 1 ) } {
+        append clienthello_payload [TCP::payload]
+        if { [string length $clienthello_payload] < $rlen } {
+            TCP::release
+            TCP::collect
+            return
+        } else {
+            set ja4 [call parseClientHello $clienthello_payload ${rlen} ${server_ver} ${ja4_tprt}]
+            #log local0. "JA4: '${ja4}'"
+        }
     }
 
     ## Release the payload
