@@ -1,0 +1,244 @@
+###############################################################################################
+#  iRule to calculate JA4 "Client TLS" save in Access variable
+#  See JA4 spec on GitHub for more details
+#  https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
+#
+#  Copyright (c) 2024, FoxIO
+#  All rights reserved.
+#  JA4 TLS Client Fingerprinting is Open-Source, Licensed under BSD 3-Clause
+#  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
+###############################################################################################
+
+proc parseClientHello { payload rlen ja4_ver ja4_tprt } {
+
+    set ja4_sni "i"
+    ## Define GREASE values so these can be excluded from cipher list
+    set greaseList "0a0a 1a1a 2a2a 3a3a 4a4a 5a5a 6a6a 7a7a 8a8a 9a9a aaaa baba caca dada eaea fafa"
+
+    ## HEADERS - SKIP: Already captured in XXX_DATA event (record header, handshake header, server version, server random)
+    set field_offset 43
+
+    ## SESSION ID - SKIP
+    binary scan ${payload} @${field_offset}c sessID_len
+    set field_offset [expr {${field_offset} + 1 + ${sessID_len}}]
+
+    ## CLIENT CIPHERS
+    ## Capture cipher list length and incr offset
+    binary scan ${payload} @${field_offset}S cipherList_len
+    set field_offset [expr {${field_offset} + 2}]
+
+    set cipher_offset 0
+    set cipher_cnt 0
+    set cipher_list [list]
+    while { [expr {${cipher_offset} < ${cipherList_len}}] } {
+        binary scan ${payload} @${field_offset}H4 cipher_hex
+        if { [lsearch -sorted -inline $greaseList $cipher_hex] eq "" } {
+            lappend cipher_list ${cipher_hex}
+            incr cipher_cnt
+        }
+        set cipher_offset [expr {${cipher_offset} + 2}]
+        set field_offset [expr {${field_offset} + 2}]
+    }
+    ## Sort cipher_list
+    set cipher_list [lsort $cipher_list]
+    ## Convert list to comma-separated string
+    set cipher_str ""
+    foreach cipher_hex $cipher_list {
+        append cipher_str "${cipher_hex},"
+    }
+    set cipher_str [string trimright ${cipher_str} ","]
+    ## Get truncated hash of cipher list string
+    binary scan [sha256 ${cipher_str}] H* cipher_hash
+    set trunc_cipher_hash [string range $cipher_hash 0 11]
+
+    ## Format cipher count
+    if { $cipher_cnt > 99 } {
+        set cipher_cnt 99
+    }
+    set ja4_ccnt [format "%02d" $cipher_cnt]
+
+    ## COMPRESSION METHOD - SKIP
+    binary scan ${payload} @${field_offset}c compression_len
+    set field_offset [expr {${field_offset} + 1 + ${compression_len}}]
+
+
+    ## EXTENSIONS 
+    set ja4_ecnt 0
+    set ja4_etype_list [list]
+    set ja4_alpn "00"
+    set siga_list ""
+
+    ## Check if there is more data
+    if { [expr {${field_offset} < ${rlen}}] } {
+        ## Capture Extensions length and incr offset
+        binary scan ${payload} @${field_offset}S extList_len
+        set field_offset [expr {${field_offset} + 2}]
+
+        ## Pad rlen by 1 byte
+        set rlen [expr ${rlen} + 1]
+
+        ## Parse Extensions
+        while { [expr {${field_offset} <= ${rlen}}] } {
+            ## Capture Ext Type, Incr offset past Ext Type
+            binary scan ${payload} @${field_offset}H4 ext_hex
+            set field_offset [expr {${field_offset} + 2}]
+
+            ## Capture Ext Length, Incr offset past Ext Length
+            binary scan ${payload} @${field_offset}S ext_len
+            set field_offset [expr {${field_offset} + 2}]
+
+            ## Check for GREASE values, if GREASE incr offset by Ext Length
+            if {[lsearch -sorted -inline $greaseList $ext_hex] ne "" } {
+                set field_offset [expr {${field_offset} + ${ext_len}}]
+                continue
+            } else {
+                ## Check for specific Extension Types
+                switch $ext_hex {
+                    "0000" {
+                        ## SNI (00)
+                        ## Set JA4 domain/ip field
+                        set ja4_sni "d"
+                        incr ja4_ecnt
+                    }
+                    "000d" {
+                        ## Signature Algorithms (13)
+                        ## Capture Signature Algorithms length
+                        binary scan ${payload} @${field_offset}S siga_len
+                        set siga_offset 0
+                        while { [expr {${siga_offset} <= ${siga_len}}] } {
+                            binary scan ${payload} @[expr {${field_offset} + 2 + ${siga_offset}}]H4 siga_hex
+                            if { [lsearch -sorted -inline $greaseList $siga_hex] eq "" } {
+                                append siga_list "${siga_hex},"
+                            }
+                            incr siga_offset 2
+                        }
+                        set siga_list [string trimright ${siga_list} ","]
+                        lappend ja4_etype_list ${ext_hex}
+                        incr ja4_ecnt
+
+                    }
+                    "0010" {
+                        ## ALPN (16)
+                        ## Capture APLN length and First ALPN string length
+                        binary scan ${payload} @${field_offset}Sc alpn_len alpn_str_len
+                        ## Capture the First APLN string value
+                        binary scan ${payload} @[expr {${field_offset} + 3}]a${alpn_str_len} alpn_str
+                        incr ja4_ecnt
+                    }
+                    "0027" {
+                        ## Supported EKT Ciphers (39)
+                        ## Set JA4 Transport Protocol as QUIC
+                        set ja4_tprt "q"
+                        lappend ja4_etype_list ${ext_hex}
+                        incr ja4_ecnt
+                    }
+                    "002b" {
+                        ## Supported Versions (43)
+                        ## Capture Supported Versions length
+                        binary scan ${payload} @${field_offset}c sver_len
+                        set sver_offset 0
+                        set sver_list [list]
+                        while { [expr {${sver_offset} < ${sver_len}}] } {
+                            binary scan ${payload} @[expr {${field_offset} + 1 + ${sver_offset}}]H4 sver_hex
+                            if { [lsearch -sorted -inline $greaseList $sver_hex] eq "" } {
+                                lappend sver_list ${sver_hex}
+                            }
+                            incr sver_offset 2
+                        }
+                        set sver_list [lsort $sver_list]
+                        set ja4_ver [lindex $sver_list end]
+                        lappend ja4_etype_list ${ext_hex}
+                        incr ja4_ecnt
+                    } default {
+                        lappend ja4_etype_list ${ext_hex}
+                        incr ja4_ecnt
+                    }
+                }
+
+                ## Incr offset past the extension data length. Repeat this loop until we reach rlen (the end of the payload)
+                set field_offset [expr {${field_offset} + ${ext_len}}]
+            }
+        }
+    }
+    ## Set JA4 ALPN value
+    if { [info exist alpn_str] } {
+        set ja4_alpn "[string index ${alpn_str} 0][string index ${alpn_str} end]"
+    }
+
+    ## Format extensions count var
+    if { $ja4_ecnt > 99 } {
+        set ja4_ecnt 99
+    }
+    set ja4_ecnt [format "%02d" $ja4_ecnt]
+
+    ## Sort and format extensions type list
+    set ja4_etype_list [lsort $ja4_etype_list]
+    set ja4_etype_str ""
+    foreach ext_type_hex $ja4_etype_list {
+        append ja4_etype_str "${ext_type_hex},"
+    }
+    set ja4_etype_str [string trimright ${ja4_etype_str} ","]
+    ## If present, append signature algorithms list to extensions list
+    if { ${siga_list} ne ""} {
+        set ja4_etype_str "${ja4_etype_str}_${siga_list}"
+    }
+    ## Hash extensions list
+    binary scan [sha256 ${ja4_etype_str}] H* ja4_ext_hash
+    set ja4_ext_hash_trunc [string range ${ja4_ext_hash} 0 11]
+
+    ## Format version
+    switch $ja4_ver {
+        0304 { set ja4_ver "13" }
+        0303 { set ja4_ver "12" }
+        0302 { set ja4_ver "11" }
+        0301 { set ja4_ver "10" }
+        0300 { set ja4_ver "s3" }
+        0200 { set ja4_ver "s2" }
+        0100 { set ja4_ver "s1" }
+    }
+
+    ##Build JA4 string
+    set ja4_str "${ja4_tprt}${ja4_ver}${ja4_sni}${ja4_ccnt}${ja4_ecnt}${ja4_alpn}_${trunc_cipher_hash}_${ja4_ext_hash_trunc}"
+    set ja4_r_str "${ja4_tprt}${ja4_ver}${ja4_sni}${ja4_ccnt}${ja4_ecnt}${ja4_alpn}_${cipher_str}_${ja4_etype_str}"
+
+    return "${ja4_str}"
+}
+
+
+when CLIENT_ACCEPTED {
+    unset -nocomplain rlen
+    set ja4_tprt "t"
+    ## Collect the TCP payload
+    TCP::collect
+}
+
+when CLIENT_DATA {
+
+    ## Get the TLS packet type and versions
+    if { ! [info exists rlen] } {
+        binary scan [TCP::payload] cH4ScH6H4 rtype proto_ver rlen hs_type rilen server_ver
+        #log local0. "rtype ${rtype} proto_ver ${proto_ver} rlen ${rlen} hs_type ${hs_type} rilen ${rilen} server_ver ${server_ver}"
+
+        if { ( ${rtype} == 22 ) and ( ${hs_type} == 1 ) } {
+            #log local0. "Found CLIENT_HELLO"
+            set ja4 [call parseClientHello [TCP::payload] ${rlen} ${server_ver} ${ja4_tprt}]
+            #log local0. "JA4: '${ja4}'"
+
+        }
+    }
+
+    # Collect the rest of the record if necessary
+    if { [TCP::payload length] < $rlen } {
+        TCP::collect $rlen
+    }
+
+    ## Release the payload
+    TCP::release
+}
+
+when ACCESS_POLICY_AGENT_EVENT {
+            if { [ACCESS::policy agent_id] eq "JA4FP" } {
+            ACCESS::session data set session.custom.JA4 $ja4
+
+            }
+}
