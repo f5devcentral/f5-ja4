@@ -35,7 +35,13 @@ when HTTP_REQUEST priority 10 {
             set alval [string range  $alval 0 [string first ";" $alval]]
         }
         set alval [string tolower [string range [string map {"-" ""} ${alval}] 0 3]]
-        set lang [string replace $lang 0 [string length ${alval}] ${alval}]
+        if { ${alval} matches_regex "\[^a-z\]\{1,\}" } {
+            binary scan ${alval} H* alval
+        }
+        if {[string length ${alval}] > 4 } {
+            set alval [string range ${alval} 0 3]
+        }
+        set lang [string replace $lang 0 [expr [string length ${alval}]-1] ${alval}]
     }
     
     #Collect JA4H "b" values
