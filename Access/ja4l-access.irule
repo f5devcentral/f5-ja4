@@ -1,0 +1,56 @@
+###############################################################################################
+#  iRule to calculate JA4L "light distance"
+#  See JA4L spec on GitHub for more details
+#  https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4L.md 
+#  and information on calculating different distance/latency items.
+#
+#  Copyright (c) 2024, FoxIO, LLC.
+#  All rights reserved.
+#  Licensed under FoxIO License 1.1
+#  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
+###############################################################################################
+
+when FLOW_INIT {
+    #Set timestamp for initial received SYN
+    set ja4l_ts1 [clock clicks]
+    #log local0. "ja4l_ts1: ${ja4l_ts1}"
+}
+
+when CLIENT_ACCEPTED {
+    #Set timestamp for final received SYN/ACK
+    set ja4l_ts2 [clock clicks]
+    #log local0. "ja4l_ts2: ${ja4l_ts2}"
+
+    #Calculate time difference - (ts2-ts1)/2
+    set ja4l_tcp_latency [expr ($ja4l_ts2 - $ja4l_ts1)/2]
+
+    # Get IP TTL
+    set ttl [IP::ttl]
+
+}
+
+when CLIENTSSL_CLIENTHELLO {
+    set ja4l_ts3 [clock clicks]
+}
+
+when CLIENTSSL_HANDSHAKE {
+    set ja4l_ts4 [clock clicks]
+    # Calculate "application latency"
+    set ja4l_app_latency [expr ($ja4l_ts4 - $ja4l_ts3)/2]
+
+    # Defone JA4L string
+    set ja4l "${ja4l_tcp_latency}_${ttl}_${ja4l_app_latency}"
+
+}
+
+
+
+when ACCESS_POLICY_AGENT_EVENT {
+            if { [ACCESS::policy agent_id] eq "JA4FPL" } {
+            ACCESS::session data set session.custom.JA4l $ja4l
+            ACCESS::session data set session.custom.JA4la [getfield $ja4l "_" 1]
+            ACCESS::session data set session.custom.JA4lb [getfield $ja4l "_" 2]
+            ACCESS::session data set session.custom.JA4lc [getfield $ja4l "_" 3]
+
+            }
+}
