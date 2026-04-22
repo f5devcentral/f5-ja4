@@ -7,25 +7,48 @@
 #  All rights reserved.
 #  Licensed under FoxIO License 1.1
 #  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
+#
+#  Hardened version - addresses:
+#    1. Client-supplied X-JA4L header spoofing: any inbound X-JA4L header is
+#       removed before the rule inserts its own computed value.
+#    2. Per-flow state leakage: ja4l_ts1..4 and ja4l are explicitly cleared at
+#       FLOW_INIT / CLIENT_ACCEPTED so values from a reused/mirrored flow
+#       cannot be stamped onto a later request.
+#    3. Negative or anomalously large latency values (which can arise from
+#       non-monotonic clock clicks, clock wrap, or core switches) are clamped
+#       to 0 / a sane upper bound so downstream policy cannot be fooled into
+#       treating a spoofed extreme as trustworthy.
+#    4. All expr calls braced.
 ###############################################################################################
 
+when RULE_INIT {
+    # Upper bound for a reported latency value (microseconds). Anything above
+    # this is treated as clock noise and clamped.
+    set static::ja4l_max_latency 10000000
+}
+
 when FLOW_INIT {
-    #Set timestamp for initial received SYN
+    unset -nocomplain ja4l_ts1
+    unset -nocomplain ja4l_ts2
+    unset -nocomplain ja4l_ts3
+    unset -nocomplain ja4l_ts4
+    unset -nocomplain ja4l
     set ja4l_ts1 [clock clicks]
-    #log local0. "ja4l_ts1: ${ja4l_ts1}"
 }
 
 when CLIENT_ACCEPTED {
-    #Set timestamp for final received SYN/ACK
     set ja4l_ts2 [clock clicks]
-    #log local0. "ja4l_ts2: ${ja4l_ts2}"
 
-    #Calculate time difference - (ts2-ts1)/2
-    set ja4l_tcp_latency [expr ($ja4l_ts2 - $ja4l_ts1)/2]
+    set ja4l_tcp_latency 0
+    if { [info exists ja4l_ts1] } {
+        set ja4l_tcp_latency [expr {($ja4l_ts2 - $ja4l_ts1) / 2}]
+        if { ${ja4l_tcp_latency} < 0 } { set ja4l_tcp_latency 0 }
+        if { ${ja4l_tcp_latency} > $static::ja4l_max_latency } {
+            set ja4l_tcp_latency $static::ja4l_max_latency
+        }
+    }
 
-    # Get IP TTL
     set ttl [IP::ttl]
-
 }
 
 when CLIENTSSL_CLIENTHELLO {
@@ -34,15 +57,30 @@ when CLIENTSSL_CLIENTHELLO {
 
 when CLIENTSSL_HANDSHAKE {
     set ja4l_ts4 [clock clicks]
-    # Calculate "application latency"
-    set ja4l_app_latency [expr ($ja4l_ts4 - $ja4l_ts3)/2]
-    
-    # Defone JA4L string
+
+    set ja4l_app_latency 0
+    if { [info exists ja4l_ts3] } {
+        set ja4l_app_latency [expr {($ja4l_ts4 - $ja4l_ts3) / 2}]
+        if { ${ja4l_app_latency} < 0 } { set ja4l_app_latency 0 }
+        if { ${ja4l_app_latency} > $static::ja4l_max_latency } {
+            set ja4l_app_latency $static::ja4l_max_latency
+        }
+    }
+
+    if { ![info exists ttl] } { set ttl 0 }
+    if { ![info exists ja4l_tcp_latency] } { set ja4l_tcp_latency 0 }
+
     set ja4l "${ja4l_tcp_latency}_${ttl}_${ja4l_app_latency}"
-    
 }
 
 when HTTP_REQUEST {
+    # Strip any client-supplied X-JA4L* headers first to prevent spoofing.
+    foreach jh [HTTP::header names] {
+        if { [string tolower ${jh}] starts_with "x-ja4l" } {
+            HTTP::header remove ${jh}
+        }
+    }
+
     if { [info exists ja4l] } {
         HTTP::header insert "X-JA4L" "${ja4l}"
     }

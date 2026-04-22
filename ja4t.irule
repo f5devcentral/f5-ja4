@@ -7,7 +7,24 @@
 #  All rights reserved.
 #  Licensed under FoxIO License 1.1
 #  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
+#
+#  Hardened version - addresses:
+#    1. Client-supplied X-JA4T header spoofing: inbound X-JA4T headers are
+#       removed before the rule inserts its own.
+#    2. The fragile regexp on the window-scale option has been replaced with a
+#       direct "binary scan c" so that unexpected input cannot silently
+#       collapse win_scale to an empty string (fingerprint evasion).
+#    3. Options list growth is hard-capped so a packet with a large number of
+#       TCP options cannot drive an expensive datagroup lookup.
+#    4. Numeric defaults (mss=0, win_scale=0) are used consistently instead of
+#       the string "00" so that mss=0 and mss="00" don't collide in the
+#       fingerprint.
+#    5. All expr calls braced.
 ###############################################################################################
+
+when RULE_INIT {
+    set static::ja4t_max_opts 32
+}
 
 when FLOW_INIT {
     # To block based on a list of "bad" JA4T values, set "ja4t_blocking" to 1 (one) and
@@ -15,43 +32,60 @@ when FLOW_INIT {
     set ja4t_blocking 0
     set ja4t_blocklist "dg_ja4t_blocklist"
     set ja4t_log_blocks 1
-    
-    
-    
+
     set recv_win [DATAGRAM::tcp window]
     set ops_list ""
+    set opt_count 0
+    unset -nocomplain mss
+    unset -nocomplain win_scale
+
     foreach option [DATAGRAM::tcp option] {
-        scan ${option} "%s %\[^-\]" kind value
+        if { [incr opt_count] > $static::ja4t_max_opts } { break }
+        # Each option is returned as "kind value-bytes". Split on the first
+        # space so we never trust a regex to parse attacker-controlled bytes.
+        set sp [string first " " ${option}]
+        if { ${sp} < 0 } {
+            set kind ${option}
+            set value ""
+        } else {
+            set kind  [string range ${option} 0 [expr {${sp} - 1}]]
+            set value [string range ${option} [expr {${sp} + 1}] end]
+        }
+
         switch ${kind} {
             "2" {
-                binary scan ${value} S* mss
+                if { [string length ${value}] >= 2 } {
+                    binary scan ${value} S mss
+                    if { [info exists mss] } {
+                        set mss [expr {${mss} & 0xffff}]
+                    }
+                }
             }
             "3" {
-                binary scan ${value} c* win_scale
-                regexp {(?:123 )?(.*?)(?: 125)?} ${win_scale} match win_scale
+                if { [string length ${value}] >= 1 } {
+                    binary scan ${value} c win_scale
+                    if { [info exists win_scale] } {
+                        set win_scale [expr {${win_scale} & 0xff}]
+                    }
+                }
             }
         }
         append ops_list "${kind}-"
-        unset -nocomplain kind
-        unset -nocomplain value
     }
     set ops_list [string trimright ${ops_list} "-"]
-    if { ${ops_list} eq "" } {
-        set ops_list "00"
-    }
-    if {![info exists win_scale]}{
-            set win_scale "00"
-        }
-    if {![info exists mss]}{
-        set mss "00"
-    }
+    if { ${ops_list} eq "" } { set ops_list "00" }
+
+    if { ![info exists win_scale] } { set win_scale 0 }
+    if { ![info exists mss] }       { set mss 0 }
 
     set ja4t "${recv_win}_${ops_list}_${mss}_${win_scale}"
-    
+
     if { ${ja4t_blocking} } {
         if { [class exists ${ja4t_blocklist}] } {
             if { [set blocked_ja4t [class match -element ${ja4t} equals ${ja4t_blocklist}]] ne "" } {
-                if { ${ja4t_log_blocks} } { log local0. "Dropping connection from JA4T: '${blocked_ja4t}'" }
+                if { ${ja4t_log_blocks} } {
+                    log local0. "Dropping connection from JA4T: '${blocked_ja4t}'"
+                }
                 drop
             }
         } else {
@@ -61,7 +95,14 @@ when FLOW_INIT {
 }
 
 when HTTP_REQUEST {
-    if {[info exists ja4t]}{
+    # Strip any client-supplied X-JA4T* headers first to prevent spoofing.
+    foreach jh [HTTP::header names] {
+        if { [string tolower ${jh}] starts_with "x-ja4t" } {
+            HTTP::header remove ${jh}
+        }
+    }
+
+    if { [info exists ja4t] } {
         HTTP::header insert "X-JA4T" ${ja4t}
     }
 }

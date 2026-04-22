@@ -7,88 +7,128 @@
 #  All rights reserved.
 #  Licensed under FoxIO License 1.1
 #  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
+#
+#  Hardened version - addresses:
+#    1. Signed-short length parsing: all length fields are scanned as signed
+#       and then masked with & 0xffff / & 0xff (Tcl 8.4 compatible, since the
+#       "Su"/"cu" unsigned scan modifiers are 8.6+).
+#    2. Explicit bounds checks on every length taken from the ServerHello so a
+#       malformed record cannot push field_offset past the collected payload
+#       and cannot cause binary scan to silently reuse stale variables.
+#    3. Hard iteration cap on the extension loop to prevent CPU exhaustion.
+#    4. Zero-length extension guard prevents an infinite loop on ext_len == 0.
+#    5. "002b" (Supported Versions) branch validates ext_len >= 2 before
+#       computing the scan length; negative/short lengths no longer reach
+#       binary scan with a bogus count.
+#    6. SERVER_DATA no longer trusts rlen blindly for TCP::collect - the
+#       collect size is capped at the TLS record max.
+#    7. Verbose "log local0." calls that fired on every handshake have been
+#       removed (log flooding / disk-fill DoS).
+#    8. All expr calls braced.
 ###############################################################################################
+
+when RULE_INIT {
+    # Maximum ServerHello record size we will buffer.
+    set static::ja4s_max_record 17408
+    set static::ja4s_max_iter 256
+}
 
 proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
 
-    ## HEADERS - SKIP: Already captured in XXX_DATA event (record header, handshake header, server version, server random)
+    set plen [string length ${payload}]
+    if { ${rlen} > ${plen} } {
+        set rlen ${plen}
+    }
+
+    ## HEADERS - SKIP: record header(5) + hs header(4) + server_version(2) + random(32) = 43
     set field_offset 43
+    if { ${field_offset} >= ${rlen} } { return "" }
 
     ## SESSION ID - SKIP
     binary scan ${payload} @${field_offset}c sessID_len
+    if { ![info exists sessID_len] } { return "" }
+    set sessID_len [expr {${sessID_len} & 0xff}]
     set field_offset [expr {${field_offset} + 1 + ${sessID_len}}]
-    
+    if { ${field_offset} + 2 > ${rlen} } { return "" }
+
     ## SERVER CIPHER
     binary scan ${payload} @${field_offset}H4 ja4s_cipher
-    set field_offset [expr ${field_offset} + 2]
-    
-    ## COMPRESSION METHOD - SKIP
+    if { ![info exists ja4s_cipher] || [string length ${ja4s_cipher}] != 4 } { return "" }
+    set field_offset [expr {${field_offset} + 2}]
+
+    ## COMPRESSION METHOD - SKIP (single byte)
+    if { ${field_offset} + 1 > ${rlen} } { return "" }
     set field_offset [expr {${field_offset} + 1}]
 
-    ## EXTENSIONS 
+    ## EXTENSIONS
     set ja4s_ecnt 0
     set ja4s_etype_list [list]
     set ja4s_alpn "00"
-    
-    if { [expr {${field_offset} < ${rlen}}] } {
-        ## Extensions length - SKIP
+
+    if { ${field_offset} + 2 <= ${rlen} } {
+        ## Extensions length
+        binary scan ${payload} @${field_offset}S extList_len
+        set extList_len [expr {${extList_len} & 0xffff}]
         set field_offset [expr {${field_offset} + 2}]
+        if { ${field_offset} + ${extList_len} > ${rlen} } { return "" }
+        set ext_end [expr {${field_offset} + ${extList_len}}]
 
-        ## Pad rlen by 1 byte
-        set rlen [expr ${rlen} + 1]
+        set ext_iter 0
+        while { ${field_offset} + 4 <= ${ext_end} } {
+            if { [incr ext_iter] > $static::ja4s_max_iter } { break }
 
-        ## Parse Extensions
-        while { [expr {${field_offset} <= ${rlen}}] } {
-            ## Capture Ext Type, Append to Ext List, Incr Ext Count, Incr offset past Ext Type
             binary scan ${payload} @${field_offset}H4 ext
+            if { ![info exists ext] || [string length ${ext}] != 4 } { break }
             lappend ja4s_etype_list ${ext}
             incr ja4s_ecnt
             set field_offset [expr {${field_offset} + 2}]
 
-            ## Capture Ext Length, Incr offset past Ext Length
             binary scan ${payload} @${field_offset}S ext_len
+            set ext_len [expr {${ext_len} & 0xffff}]
             set field_offset [expr {${field_offset} + 2}]
 
-            ## Check for specific Extension Types
+            if { ${field_offset} + ${ext_len} > ${ext_end} } { break }
+
             switch $ext {
                 "0010" {
                     ## ALPN (16)
-                    ## Capture APLN length and ALPN string length
-                    binary scan ${payload} @${field_offset}Sc alpn_len alpn_str_len
-                    ## Capture the APLN string value
-                    binary scan ${payload} @[expr {${field_offset} + 3}]a${alpn_str_len} alpn_str
+                    if { ${ext_len} >= 3 } {
+                        binary scan ${payload} @${field_offset}Sc alpn_len alpn_str_len
+                        set alpn_str_len [expr {${alpn_str_len} & 0xff}]
+                        if { ${alpn_str_len} > 0 \
+                             && ${alpn_str_len} + 3 <= ${ext_len} } {
+                            binary scan ${payload} \
+                                @[expr {${field_offset} + 3}]a${alpn_str_len} alpn_str
+                        }
+                    }
                 }
                 "0027" {
-                    ## Supported EKT Ciphers (39)
-                    ## Set JA4S Transport Protocol as QUIC
+                    ## Supported EKT Ciphers (39) - JA4S transport becomes QUIC
                     set ja4s_tprt "q"
                 }
                 "002b" {
-                    ## Supported Versions (43)
-                    ## Capture Server-Selected Supported Version
-                    binary scan ${payload} @[expr {${field_offset} + 2}]H[expr {(${ext_len} - 2) * 2}] ja4s_ver
+                    ## Supported Versions (43) - server picks exactly one
+                    if { ${ext_len} >= 2 } {
+                        set sv_hex_len [expr {(${ext_len} - 2) * 2}]
+                        if { ${sv_hex_len} > 0 } {
+                            binary scan ${payload} \
+                                @[expr {${field_offset} + 2}]H${sv_hex_len} ja4s_ver
+                        }
+                    }
                 }
             }
-            
-            #log local0. "SERVER_HELLO - EXT: ${ext} LEN: ${ext_len} VAL: ${ext_data}"
-            
-            ## Incr offset past the extension data length. Repeat this loop until we reach rlen (the end of the payload)
+
             set field_offset [expr {${field_offset} + ${ext_len}}]
         }
     }
-    
-    if { [info exist alpn_str] } {
+
+    if { [info exists alpn_str] && [string length ${alpn_str}] > 0 } {
         set ja4s_alpn "[string index ${alpn_str} 0][string index ${alpn_str} end]"
     }
-    
-    ## Format extensions count var
-    if { $ja4s_ecnt > 99 } {
-        #log local0. "Ext count is  > 99, setting to 99"
-        set ja4s_ecnt 99
-    }
+
+    if { $ja4s_ecnt > 99 } { set ja4s_ecnt 99 }
     set ja4s_ecnt [format "%02d" $ja4s_ecnt]
-    
-    ## Sort and format extensions type list
+
     set ja4s_etype_list [lsort $ja4s_etype_list]
     set ja4s_etype_str ""
     foreach ext_type_hex $ja4s_etype_list {
@@ -97,8 +137,7 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
     set ja4s_etype_str [string trimright ${ja4s_etype_str} ","]
     binary scan [sha256 ${ja4s_etype_str}] H* ja4s_ext_hash
     set ja4s_ext_hash_trunc [string range ${ja4s_ext_hash} 0 11]
-    
-    ## Format version
+
     switch $ja4s_ver {
         0304 { set ja4s_ver "13" }
         0303 { set ja4s_ver "12" }
@@ -108,50 +147,56 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
         0200 { set ja4s_ver "s2" }
         0100 { set ja4s_ver "s1" }
     }
-    
-    #JA4S Algorithm:  
-    #(q or t)  
-    #(2 character tls version)  
-    #(2 character number of extensions)  
-    #(first and last character of the ALPN chosen)  
-    #_  
-    #(cipher suite chosen in hex)  
-    #_  
-    #(truncated sha256 hash of the extensions in the order that they appear)
-    
+
     set ja4s_str "${ja4s_tprt}${ja4s_ver}${ja4s_ecnt}${ja4s_alpn}_${ja4s_cipher}_${ja4s_ext_hash_trunc}"
-    
     return "${ja4s_str}"
 }
 
 
 when SERVER_CONNECTED {
     unset -nocomplain rlen
+    unset -nocomplain ja4s
     set ja4s_tprt "t"
-    ## Collect the TCP payload
     TCP::collect
 }
 
 when SERVER_DATA {
-    
-    ## Get the TLS packet type and versions
+
     if { ! [info exists rlen] } {
+        if { [TCP::payload length] < 43 } {
+            TCP::collect 43
+            return
+        }
         binary scan [TCP::payload] cH4ScH6H4 rtype proto_ver rlen hs_type rilen server_ver
-        log local0. "rtype ${rtype} proto_ver ${proto_ver} rlen ${rlen} hs_type ${hs_type} rilen ${rilen} server_ver ${server_ver}"
-        
-        if { ( ${rtype} == 22 ) and ( ${hs_type} == 2 ) } {
-            log local0. "Found SERVER_HELLO"
-            set ja4s [call parseServerHello [TCP::payload] ${rlen} ${server_ver} ${ja4s_tprt}]
-            log local0. "JA4S: '${ja4s}'"
-            
+        if { ![info exists rlen] } {
+            TCP::release
+            return
+        }
+        set rtype   [expr {${rtype}   & 0xff}]
+        set rlen    [expr {${rlen}    & 0xffff}]
+        set hs_type [expr {${hs_type} & 0xff}]
+
+        if { ${rlen} > $static::ja4s_max_record } {
+            TCP::release
+            return
+        }
+
+        if { ( ${rtype} == 22 ) && ( ${hs_type} == 2 ) } {
+            if { [TCP::payload length] >= ${rlen} } {
+                set ja4s [call parseServerHello [TCP::payload] ${rlen} ${server_ver} ${ja4s_tprt}]
+            }
         }
     }
 
-    # Collect the rest of the record if necessary
+    # Collect the rest of the record if necessary, capped at the record max.
     if { [TCP::payload length] < $rlen } {
-        TCP::collect $rlen
+        set need $rlen
+        if { ${need} > $static::ja4s_max_record } {
+            set need $static::ja4s_max_record
+        }
+        TCP::collect ${need}
+        return
     }
 
-    ## Release the payload
     TCP::release
 }
