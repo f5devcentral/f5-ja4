@@ -326,10 +326,3 @@ when CLIENT_DATA {
 
     TCP::release
 }
-
-when HTTP_REQUEST {
-    HTTP::header remove "X-JA4"
-    if { [info exists ja4_fingerprint] } {
-        HTTP::header insert "X-JA4"   $ja4_fingerprint
-    }
-}
