@@ -8,20 +8,6 @@
 #  Licensed under FoxIO License 1.1
 #  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
 #
-#  Hardened version - addresses:
-#    1. Broken "if { cond }{body}" syntax in the upstream rule (Tcl parse error
-#       when ja4h_original is enabled). All if/else blocks now have the
-#       required whitespace between the condition and the body.
-#    2. Client-supplied X-JA4H* header spoofing - any inbound X-JA4H* headers
-#       are removed before the rule computes and inserts its own value.
-#    3. Session-token leak via X-JA4H_r(o): the raw variant no longer contains
-#       cookie values. Cookie values are only represented through the
-#       truncated SHA-256 (trunc_ckvhash), as the JA4H spec intends.
-#    4. CPU amplification via long Accept-Language + matches_regex: the header
-#       value is length-capped before any regex work.
-#    5. Off-by-one in the Accept-Language trimming on ";" (was keeping the
-#       semicolon).
-#    6. All expr calls are braced.
 ###############################################################################################
 
 when RULE_INIT {

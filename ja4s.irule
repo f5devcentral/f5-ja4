@@ -8,23 +8,6 @@
 #  Licensed under FoxIO License 1.1
 #  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
 #
-#  Hardened version - addresses:
-#    1. Signed-short length parsing: all length fields are scanned as signed
-#       and then masked with & 0xffff / & 0xff (Tcl 8.4 compatible, since the
-#       "Su"/"cu" unsigned scan modifiers are 8.6+).
-#    2. Explicit bounds checks on every length taken from the ServerHello so a
-#       malformed record cannot push field_offset past the collected payload
-#       and cannot cause binary scan to silently reuse stale variables.
-#    3. Hard iteration cap on the extension loop to prevent CPU exhaustion.
-#    4. Zero-length extension guard prevents an infinite loop on ext_len == 0.
-#    5. "002b" (Supported Versions) branch validates ext_len >= 2 before
-#       computing the scan length; negative/short lengths no longer reach
-#       binary scan with a bogus count.
-#    6. SERVER_DATA no longer trusts rlen blindly for TCP::collect - the
-#       collect size is capped at the TLS record max.
-#    7. Verbose "log local0." calls that fired on every handshake have been
-#       removed (log flooding / disk-fill DoS).
-#    8. All expr calls braced.
 ###############################################################################################
 
 when RULE_INIT {

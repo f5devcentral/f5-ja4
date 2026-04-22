@@ -8,17 +8,6 @@
 #  Licensed under FoxIO License 1.1
 #  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
 #
-#  Hardened version - addresses:
-#    1. Client-supplied X-JA4L header spoofing: any inbound X-JA4L header is
-#       removed before the rule inserts its own computed value.
-#    2. Per-flow state leakage: ja4l_ts1..4 and ja4l are explicitly cleared at
-#       FLOW_INIT / CLIENT_ACCEPTED so values from a reused/mirrored flow
-#       cannot be stamped onto a later request.
-#    3. Negative or anomalously large latency values (which can arise from
-#       non-monotonic clock clicks, clock wrap, or core switches) are clamped
-#       to 0 / a sane upper bound so downstream policy cannot be fooled into
-#       treating a spoofed extreme as trustworthy.
-#    4. All expr calls braced.
 ###############################################################################################
 
 when RULE_INIT {

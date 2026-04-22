@@ -8,18 +8,6 @@
 #  Licensed under FoxIO License 1.1
 #  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
 #
-#  Hardened version - addresses:
-#    1. Client-supplied X-JA4T header spoofing: inbound X-JA4T headers are
-#       removed before the rule inserts its own.
-#    2. The fragile regexp on the window-scale option has been replaced with a
-#       direct "binary scan c" so that unexpected input cannot silently
-#       collapse win_scale to an empty string (fingerprint evasion).
-#    3. Options list growth is hard-capped so a packet with a large number of
-#       TCP options cannot drive an expensive datagroup lookup.
-#    4. Numeric defaults (mss=0, win_scale=0) are used consistently instead of
-#       the string "00" so that mss=0 and mss="00" don't collide in the
-#       fingerprint.
-#    5. All expr calls braced.
 ###############################################################################################
 
 when RULE_INIT {
