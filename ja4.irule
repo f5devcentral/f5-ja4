@@ -93,7 +93,10 @@ when CLIENT_DATA {
     while { $off < $cs_end } {
         if { [incr cs_iter] > $static::ja4_max_iter } { break }
         unset -nocomplain cs_int cs_hex
-        binary scan $payload @${off}SH4 cs_int cs_hex
+        # Re-anchor the H4 read to @off: in a composite scan, S consumes 2 bytes
+        # so a bare "SH4" would read cs_hex from @off+2 (the NEXT cipher). The
+        # explicit @${off} makes cs_int and cs_hex the SAME 2 bytes.
+        binary scan $payload @${off}S@${off}H4 cs_int cs_hex
         if { ![info exists cs_hex] || [string length $cs_hex] != 4 } { break }
         set cs_int [expr { $cs_int & 0xffff }]
         incr off 2
@@ -131,7 +134,9 @@ when CLIENT_DATA {
             if { [incr ext_iter] > $static::ja4_max_iter } { break }
 
             unset -nocomplain et_int et_hex
-            binary scan $payload @${off}SH4 et_int et_hex
+            # Re-anchor H4 to @off (see cipher loop): otherwise et_hex would be
+            # the extension LENGTH field, not the extension TYPE.
+            binary scan $payload @${off}S@${off}H4 et_int et_hex
             if { ![info exists et_hex] || [string length $et_hex] != 4 } { break }
             set et_int [expr { $et_int & 0xffff }]
             incr off 2
@@ -170,7 +175,7 @@ when CLIENT_DATA {
                             while { $sa_off + 2 <= $sa_end } {
                                 if { [incr sa_iter] > $static::ja4_max_iter } { break }
                                 unset -nocomplain sa_int sa_hex
-                                binary scan $payload @${sa_off}SH4 sa_int sa_hex
+                                binary scan $payload @${sa_off}S@${sa_off}H4 sa_int sa_hex
                                 if { ![info exists sa_hex] || [string length $sa_hex] != 4 } { break }
                                 set sa_int [expr { $sa_int & 0xffff }]
                                 incr sa_off 2
@@ -233,7 +238,7 @@ when CLIENT_DATA {
                             while { $sv_off + 2 <= $sv_end } {
                                 if { [incr sv_iter] > $static::ja4_max_iter } { break }
                                 unset -nocomplain sv_int sv_hex
-                                binary scan $payload @${sv_off}SH4 sv_int sv_hex
+                                binary scan $payload @${sv_off}S@${sv_off}H4 sv_int sv_hex
                                 if { ![info exists sv_hex] || [string length $sv_hex] != 4 } { break }
                                 set sv_int [expr { $sv_int & 0xffff }]
                                 incr sv_off 2
