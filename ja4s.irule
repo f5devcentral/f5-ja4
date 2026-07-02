@@ -60,10 +60,10 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
         while { ${field_offset} + 4 <= ${ext_end} } {
             if { [incr ext_iter] > $static::ja4s_max_iter } { break }
 
-            binary scan ${payload} @${field_offset}H4 ext
+            ## Read the extension type as both an int (for the GREASE test) and hex.
+            binary scan ${payload} @${field_offset}S@${field_offset}H4 ext_int ext
             if { ![info exists ext] || [string length ${ext}] != 4 } { break }
-            lappend ja4s_etype_list ${ext}
-            incr ja4s_ecnt
+            set ext_int [expr {${ext_int} & 0xffff}]
             set field_offset [expr {${field_offset} + 2}]
 
             binary scan ${payload} @${field_offset}S ext_len
@@ -72,28 +72,34 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
 
             if { ${field_offset} + ${ext_len} > ${ext_end} } { break }
 
-            switch $ext {
-                "0010" {
-                    ## ALPN (16)
-                    if { ${ext_len} >= 3 } {
-                        binary scan ${payload} @${field_offset}Sc alpn_len alpn_str_len
-                        set alpn_str_len [expr {${alpn_str_len} & 0xff}]
-                        if { ${alpn_str_len} > 0 \
-                             && ${alpn_str_len} + 3 <= ${ext_len} } {
-                            binary scan ${payload} \
-                                @[expr {${field_offset} + 3}]a${alpn_str_len} alpn_str
+            ## Ignore GREASE extension types - they are not counted or hashed.
+            if { ! (( ${ext_int} & 0x0f0f ) == 0x0a0a
+                    && (( ${ext_int} >> 8 ) & 0xff) == ( ${ext_int} & 0xff )) } {
+                lappend ja4s_etype_list ${ext}
+                incr ja4s_ecnt
+
+                switch $ext {
+                    "0010" {
+                        ## ALPN (16): ext data = 2-byte protocol-list length, then a
+                        ## 1-byte name length, then the name (list length unused).
+                        if { ${ext_len} >= 3 } {
+                            binary scan ${payload} @[expr {${field_offset} + 2}]c alpn_str_len
+                            set alpn_str_len [expr {${alpn_str_len} & 0xff}]
+                            if { ${alpn_str_len} > 0 \
+                                 && ${alpn_str_len} + 3 <= ${ext_len} } {
+                                binary scan ${payload} \
+                                    @[expr {${field_offset} + 3}]a${alpn_str_len} alpn_str
+                                binary scan ${payload} \
+                                    @[expr {${field_offset} + 3}]H[expr {${alpn_str_len} * 2}] alpn_hex
+                            }
                         }
                     }
-                }
-                "0027" {
-                    ## Supported EKT Ciphers (39) - JA4S transport becomes QUIC
-                    set ja4s_tprt "q"
-                }
-                "002b" {
-                    ## Supported Versions (43) - in a ServerHello this is a single
-                    ## 2-byte selected_version with NO list/length prefix (RFC 8446).
-                    if { ${ext_len} >= 2 } {
-                        binary scan ${payload} @${field_offset}H4 ja4s_ver
+                    "002b" {
+                        ## Supported Versions (43) - in a ServerHello this is a single
+                        ## 2-byte selected_version with NO list/length prefix (RFC 8446).
+                        if { ${ext_len} >= 2 } {
+                            binary scan ${payload} @${field_offset}H4 ja4s_ver
+                        }
                     }
                 }
             }
@@ -103,7 +109,23 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
     }
 
     if { [info exists alpn_str] && [string length ${alpn_str}] > 0 } {
-        set ja4s_alpn "[string index ${alpn_str} 0][string index ${alpn_str} end]"
+        ## Spec: first/last ASCII-alphanumeric chars of the ALPN; if either the
+        ## first or last byte is non-alphanumeric, use the hex representation.
+        set first_byte [scan [string index ${alpn_str} 0]   %c]
+        set last_byte  [scan [string index ${alpn_str} end] %c]
+        set first_ok [expr {
+            (${first_byte} >= 0x30 && ${first_byte} <= 0x39) ||
+            (${first_byte} >= 0x41 && ${first_byte} <= 0x5A) ||
+            (${first_byte} >= 0x61 && ${first_byte} <= 0x7A) }]
+        set last_ok [expr {
+            (${last_byte} >= 0x30 && ${last_byte} <= 0x39) ||
+            (${last_byte} >= 0x41 && ${last_byte} <= 0x5A) ||
+            (${last_byte} >= 0x61 && ${last_byte} <= 0x7A) }]
+        if { ${first_ok} && ${last_ok} } {
+            set ja4s_alpn "[string index ${alpn_str} 0][string index ${alpn_str} end]"
+        } else {
+            set ja4s_alpn "[string index ${alpn_hex} 0][string index ${alpn_hex} end]"
+        }
     }
 
     if { $ja4s_ecnt > 99 } { set ja4s_ecnt 99 }
