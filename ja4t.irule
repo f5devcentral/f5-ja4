@@ -27,6 +27,12 @@ when FLOW_INIT {
     unset -nocomplain mss
     unset -nocomplain win_scale
 
+    # KNOWN LIMITATION: [DATAGRAM::tcp option] does not return TCP option kind 0
+    # (End of Option List / EOL). Clients whose SYN carries an explicit EOL option
+    # will have it omitted from the option list, so the JA4T fingerprint can differ
+    # from one computed off the raw packet. This is a limitation of the iRule
+    # command itself and must be addressed by F5 product development; it cannot be
+    # worked around in TCL.
     foreach option [DATAGRAM::tcp option] {
         if { [incr opt_count] > $static::ja4t_max_opts } { break }
         # Each option is returned as "kind value-bytes". Split on the first
