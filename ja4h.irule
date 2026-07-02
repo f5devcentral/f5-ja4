@@ -67,17 +67,17 @@ when HTTP_REQUEST priority 10 {
     set hstr ""
     foreach hname [HTTP::header names] {
         set hl [string tolower ${hname}]
-        # Exclude Cookie (prefix match, e.g. "Cookie2") and Referer from the
-        # header list/count, matching the reference. Client-supplied X-JA4*
-        # headers were already stripped above, so no special-case is needed here.
-        if { [string match "cookie*" ${hl}] || (${hl} eq "referer") } {
-            if { ${ja4h_original} } {
-                append hstr "${hname},"
-            }
-        } else {
-            incr hc
-            append hstr "${hname},"
+        # Exclude HTTP/2 pseudo-headers (":authority", ":method", ...), Cookie
+        # (prefix match, e.g. "Cookie2") and Referer from the header list/count,
+        # matching the reference - and regardless of the original-order flag
+        # (the reference never puts Cookie/Referer in the header list). Client-
+        # supplied X-JA4* headers were already stripped above.
+        if { ([string index ${hname} 0] eq ":") \
+             || [string match "cookie*" ${hl}] || (${hl} eq "referer") } {
+            continue
         }
+        incr hc
+        append hstr "${hname},"
     }
 
     if { $hc > 99 } { set hc 99 }
