@@ -90,13 +90,10 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
                     set ja4s_tprt "q"
                 }
                 "002b" {
-                    ## Supported Versions (43) - server picks exactly one
+                    ## Supported Versions (43) - in a ServerHello this is a single
+                    ## 2-byte selected_version with NO list/length prefix (RFC 8446).
                     if { ${ext_len} >= 2 } {
-                        set sv_hex_len [expr {(${ext_len} - 2) * 2}]
-                        if { ${sv_hex_len} > 0 } {
-                            binary scan ${payload} \
-                                @[expr {${field_offset} + 2}]H${sv_hex_len} ja4s_ver
-                        }
+                        binary scan ${payload} @${field_offset}H4 ja4s_ver
                     }
                 }
             }
@@ -112,23 +109,31 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
     if { $ja4s_ecnt > 99 } { set ja4s_ecnt 99 }
     set ja4s_ecnt [format "%02d" $ja4s_ecnt]
 
-    set ja4s_etype_list [lsort $ja4s_etype_list]
+    ## JA4S keeps server extensions in their ORIGINAL order (do NOT sort, unlike
+    ## the JA4 client hash).
     set ja4s_etype_str ""
     foreach ext_type_hex $ja4s_etype_list {
         append ja4s_etype_str "${ext_type_hex},"
     }
     set ja4s_etype_str [string trimright ${ja4s_etype_str} ","]
-    binary scan [sha256 ${ja4s_etype_str}] H* ja4s_ext_hash
-    set ja4s_ext_hash_trunc [string range ${ja4s_ext_hash} 0 11]
+    if { ${ja4s_etype_str} eq "" } {
+        set ja4s_ext_hash_trunc "000000000000"
+    } else {
+        binary scan [sha256 ${ja4s_etype_str}] H* ja4s_ext_hash
+        set ja4s_ext_hash_trunc [string range ${ja4s_ext_hash} 0 11]
+    }
 
     switch $ja4s_ver {
-        0304 { set ja4s_ver "13" }
-        0303 { set ja4s_ver "12" }
-        0302 { set ja4s_ver "11" }
-        0301 { set ja4s_ver "10" }
-        0300 { set ja4s_ver "s3" }
-        0200 { set ja4s_ver "s2" }
-        0100 { set ja4s_ver "s1" }
+        "0304" { set ja4s_ver "13" }
+        "0303" { set ja4s_ver "12" }
+        "0302" { set ja4s_ver "11" }
+        "0301" { set ja4s_ver "10" }
+        "0300" { set ja4s_ver "s3" }
+        "0002" { set ja4s_ver "s2" }
+        "feff" { set ja4s_ver "d1" }
+        "fefd" { set ja4s_ver "d2" }
+        "fefc" { set ja4s_ver "d3" }
+        default { set ja4s_ver "00" }
     }
 
     set ja4s_str "${ja4s_tprt}${ja4s_ver}${ja4s_ecnt}${ja4s_alpn}_${ja4s_cipher}_${ja4s_ext_hash_trunc}"
@@ -156,7 +161,11 @@ when SERVER_DATA {
             return
         }
         set rtype   [expr {${rtype}   & 0xff}]
-        set rlen    [expr {${rlen}    & 0xffff}]
+        # rlen is the TLS record BODY length (bytes[3:4]); add the 5-byte record
+        # header so rlen represents the TOTAL record size. parseServerHello uses
+        # absolute field offsets whose base (43) already counts the 5-byte header,
+        # and the TCP::collect target below needs the full record, not just body.
+        set rlen    [expr {(${rlen}   & 0xffff) + 5}]
         set hs_type [expr {${hs_type} & 0xff}]
 
         if { ${rlen} > $static::ja4s_max_record } {
@@ -167,6 +176,9 @@ when SERVER_DATA {
         if { ( ${rtype} == 22 ) && ( ${hs_type} == 2 ) } {
             if { [TCP::payload length] >= ${rlen} } {
                 set ja4s [call parseServerHello [TCP::payload] ${rlen} ${server_ver} ${ja4s_tprt}]
+                if { ${ja4s} ne "" } {
+                    log local0. "JA4S=${ja4s} src=[IP::client_addr]:[TCP::client_port]"
+                }
             }
         }
     }
