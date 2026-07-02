@@ -27,7 +27,7 @@ when HTTP_REQUEST priority 10 {
     # Strip any client-supplied X-JA4H* headers so a client cannot spoof the
     # fingerprint that the backend sees.
     foreach jh [HTTP::header names] {
-        if { [string tolower ${jh}] starts_with "x-ja4h" } {
+        if { [string tolower ${jh}] starts_with "x-ja4" } {
             HTTP::header remove ${jh}
         }
     }
@@ -51,17 +51,12 @@ when HTTP_REQUEST priority 10 {
         if { [string length ${alval}] > $static::ja4h_max_al } {
             set alval [string range ${alval} 0 [expr {$static::ja4h_max_al - 1}]]
         }
-        if { [string first ";" ${alval}] >= 0 } {
-            # -1 fixes the off-by-one that kept the ";" character.
-            set alval [string range ${alval} 0 [expr {[string first ";" ${alval}] - 1}]]
-        }
-        set alval [string tolower [string range [string map {"-" ""} ${alval}] 0 3]]
-        if { ${alval} matches_regex {[^a-z]{1,}} } {
-            binary scan ${alval} H* alval
-        }
-        if { [string length ${alval}] > 4 } {
-            set alval [string range ${alval} 0 3]
-        }
+        # Reference JA4H: strip "-", map ";"->",", lowercase, take the first
+        # comma-delimited token, then its first 4 characters (the "0000" seed
+        # supplies right-padding). No hex-encoding: digits and other characters
+        # are kept verbatim per the reference implementation.
+        set alval [string tolower [string map {"-" "" ";" ","} ${alval}]]
+        set alval [string range [lindex [split ${alval} ","] 0] 0 3]
         if { [string length ${alval}] > 0 } {
             set lang [string replace $lang 0 [expr {[string length ${alval}] - 1}] ${alval}]
         }
@@ -71,10 +66,11 @@ when HTTP_REQUEST priority 10 {
     set hc 0
     set hstr ""
     foreach hname [HTTP::header names] {
-        if { ${hname} starts_with "X-JA4" } {
-            continue
-        } elseif { ([string tolower ${hname}] eq "cookie") \
-                   || ([string tolower ${hname}] eq "referer") } {
+        set hl [string tolower ${hname}]
+        # Exclude Cookie (prefix match, e.g. "Cookie2") and Referer from the
+        # header list/count, matching the reference. Client-supplied X-JA4*
+        # headers were already stripped above, so no special-case is needed here.
+        if { [string match "cookie*" ${hl}] || (${hl} eq "referer") } {
             if { ${ja4h_original} } {
                 append hstr "${hname},"
             }
