@@ -1,0 +1,370 @@
+###############################################################################################
+#  iRule to calculate JA4S ("Server TLS Fingerprint") and JA4X ("X.509 TLS Certificate
+#  Fingerprint") from the server side of the TLS handshake.
+#
+#  JA4S and JA4X are intentionally COMBINED into one iRule: a TCP::collect issued in
+#  SERVER_CONNECTED is honoured for only one iRule (the last one to call it wins), so a
+#  single rule must own the collect, buffer the server payload, and dispatch each TLS
+#  handshake message - ServerHello -> JA4S, Certificate -> JA4X.
+#
+#  See the JA4 spec on GitHub for more details: https://github.com/FoxIO-LLC/ja4
+#
+#  Copyright (c) 2024, FoxIO, LLC.
+#  All rights reserved.
+#  Licensed under FoxIO License 1.1
+#  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
+###############################################################################################
+
+when RULE_INIT {
+    set static::ja4s_max_record 17408
+    set static::ja4s_max_iter   256
+    # Max bytes of the Certificate record we will buffer to reach the leaf cert.
+    set static::ja4x_max_cert   17408
+    # Loop guards for DER walking (RDNs per Name, extensions per cert).
+    set static::ja4x_max_rdn    64
+    set static::ja4x_max_ext    64
+}
+
+## ------------------------------------------------------------------- DER helpers (JA4X)
+
+## Read the DER TLV header at absolute offset ${off}. Returns { tag_hex header_len content_len }.
+## Handles short form and the 0x81/0x82/0x83 long-length forms (covers any real certificate).
+proc derTlv { payload off } {
+    binary scan ${payload} @${off}H2c tag lb
+    set lb [expr {${lb} & 0xff}]
+    if { ${lb} < 0x80 } {
+        return [list ${tag} 2 ${lb}]
+    } elseif { ${lb} == 0x81 } {
+        binary scan ${payload} @[expr {${off} + 2}]c a
+        return [list ${tag} 3 [expr {${a} & 0xff}]]
+    } elseif { ${lb} == 0x82 } {
+        binary scan ${payload} @[expr {${off} + 2}]S a
+        return [list ${tag} 4 [expr {${a} & 0xffff}]]
+    } elseif { ${lb} == 0x83 } {
+        binary scan ${payload} @[expr {${off} + 2}]cS a b
+        return [list ${tag} 5 [expr {((${a} & 0xff) << 16) | (${b} & 0xffff)}]]
+    }
+    return [list ${tag} 2 0]
+}
+
+## Hash an ordered list of OID hex strings the JA4X way: sha256 of the comma-joined list,
+## truncated to 12 hex chars. NOTE: JA4X does NOT special-case the empty list (unlike JA4S),
+## so an empty issuer/subject/extension list hashes the empty string -> e3b0c44298fc.
+proc ja4xHash { oids } {
+    binary scan [sha256 [join ${oids} ","]] H* h
+    return [string range ${h} 0 11]
+}
+
+## Parse a DER Name (SEQUENCE OF RelativeDistinguishedName) at value offset ${start} of
+## length ${len}; return the attribute-type OIDs (content bytes, hex) in order. Handles
+## multi-valued RDNs (more than one AttributeTypeAndValue per SET).
+proc parseName { payload start len } {
+    set end  [expr {${start} + ${len}}]
+    set oids [list]
+    set fo   ${start}
+    set iter 0
+    while { ${fo} < ${end} && [incr iter] <= $static::ja4x_max_rdn } {
+        ## RelativeDistinguishedName ::= SET OF AttributeTypeAndValue
+        set st [call derTlv ${payload} ${fo}]
+        set set_inner [expr {${fo} + [lindex ${st} 1]}]
+        set set_end   [expr {${set_inner} + [lindex ${st} 2]}]
+        set fo ${set_end}
+        set afo   ${set_inner}
+        set aiter 0
+        while { ${afo} < ${set_end} && [incr aiter] <= 16 } {
+            ## AttributeTypeAndValue ::= SEQUENCE { type OBJECT IDENTIFIER, value ANY }
+            set at [call derTlv ${payload} ${afo}]
+            set atv_inner [expr {${afo} + [lindex ${at} 1]}]
+            set afo       [expr {${atv_inner} + [lindex ${at} 2]}]
+            set ot      [call derTlv ${payload} ${atv_inner}]
+            set oid_off [expr {${atv_inner} + [lindex ${ot} 1]}]
+            binary scan ${payload} @${oid_off}H[expr {[lindex ${ot} 2] * 2}] oidhex
+            lappend oids ${oidhex}
+        }
+    }
+    return ${oids}
+}
+
+## Parse the FIRST (leaf) certificate in a TLS Certificate handshake message and return the
+## JA4X fingerprint: issuerHash_subjectHash_extensionHash. ${offset} is the absolute offset
+## of the Certificate TLS record header (0x16 ...).
+proc parseServerCert { payload offset } {
+    ## Skip: record hdr(5) + hs type(1) + hs len(3) + certificate_list len(3) = 12
+    set fo [expr {${offset} + 12}]
+    ## Leaf certificate length (3 bytes); the leaf DER begins right after.
+    binary scan ${payload} @${fo}H6 cl
+    scan ${cl} %x cert_len
+    incr fo 3
+
+    ## Certificate ::= SEQUENCE  ->  tbsCertificate ::= SEQUENCE (descend into both)
+    set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1]}]
+    set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1]}]
+
+    ## version [0] EXPLICIT (tag a0) - optional (absent for v1); skip whole element if present
+    binary scan ${payload} @${fo}H2 tag
+    if { ${tag} eq "a0" } {
+        set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
+    }
+    ## serialNumber INTEGER - skip
+    set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
+    ## signature AlgorithmIdentifier SEQUENCE - skip whole element (algorithm-agnostic)
+    set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
+
+    ## issuer Name - collect RDN OIDs, then advance past it
+    set t [call derTlv ${payload} ${fo}]
+    set issuer_oids [call parseName ${payload} [expr {${fo} + [lindex ${t} 1]}] [lindex ${t} 2]]
+    set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
+
+    ## validity SEQUENCE - skip
+    set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
+
+    ## subject Name - collect RDN OIDs, then advance past it
+    set t [call derTlv ${payload} ${fo}]
+    set subject_oids [call parseName ${payload} [expr {${fo} + [lindex ${t} 1]}] [lindex ${t} 2]]
+    set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
+
+    ## subjectPublicKeyInfo SEQUENCE - skip
+    set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
+
+    ## optional issuerUniqueID [1] (81) / subjectUniqueID [2] (82) - skip if present
+    binary scan ${payload} @${fo}H2 tag
+    if { ${tag} eq "81" } {
+        set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
+        binary scan ${payload} @${fo}H2 tag
+    }
+    if { ${tag} eq "82" } {
+        set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
+        binary scan ${payload} @${fo}H2 tag
+    }
+
+    ## extensions [3] EXPLICIT (tag a3) -> SEQUENCE OF Extension - collect each extnID OID
+    set ext_oids [list]
+    if { ${tag} eq "a3" } {
+        set t [call derTlv ${payload} ${fo}]           ;# [3] EXPLICIT
+        set fo [expr {${fo} + [lindex ${t} 1]}]
+        set t [call derTlv ${payload} ${fo}]           ;# SEQUENCE OF Extension
+        set exts_end [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
+        set fo [expr {${fo} + [lindex ${t} 1]}]
+        set iter 0
+        while { ${fo} < ${exts_end} && [incr iter] <= $static::ja4x_max_ext } {
+            set et [call derTlv ${payload} ${fo}]      ;# Extension ::= SEQUENCE
+            set ext_inner [expr {${fo} + [lindex ${et} 1]}]
+            set fo        [expr {${fo} + [lindex ${et} 1] + [lindex ${et} 2]}]
+            ## first element of the Extension is the extnID OBJECT IDENTIFIER
+            set ot      [call derTlv ${payload} ${ext_inner}]
+            set oid_off [expr {${ext_inner} + [lindex ${ot} 1]}]
+            binary scan ${payload} @${oid_off}H[expr {[lindex ${ot} 2] * 2}] oidhex
+            lappend ext_oids ${oidhex}
+        }
+    }
+
+    return "[call ja4xHash ${issuer_oids}]_[call ja4xHash ${subject_oids}]_[call ja4xHash ${ext_oids}]"
+}
+
+## ------------------------------------------------------------------- JA4S parser
+
+proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
+
+    set plen [string length ${payload}]
+    if { ${rlen} > ${plen} } {
+        set rlen ${plen}
+    }
+
+    ## HEADERS - SKIP: record header(5) + hs header(4) + server_version(2) + random(32) = 43
+    set field_offset 43
+    if { ${field_offset} >= ${rlen} } { return "" }
+
+    ## SESSION ID - SKIP
+    binary scan ${payload} @${field_offset}c sessID_len
+    if { ![info exists sessID_len] } { return "" }
+    set sessID_len [expr {${sessID_len} & 0xff}]
+    set field_offset [expr {${field_offset} + 1 + ${sessID_len}}]
+    if { ${field_offset} + 2 > ${rlen} } { return "" }
+
+    ## SERVER CIPHER
+    binary scan ${payload} @${field_offset}H4 ja4s_cipher
+    if { ![info exists ja4s_cipher] || [string length ${ja4s_cipher}] != 4 } { return "" }
+    set field_offset [expr {${field_offset} + 2}]
+
+    ## COMPRESSION METHOD - SKIP (single byte)
+    if { ${field_offset} + 1 > ${rlen} } { return "" }
+    set field_offset [expr {${field_offset} + 1}]
+
+    ## EXTENSIONS
+    set ja4s_ecnt 0
+    set ja4s_etype_list [list]
+    set ja4s_alpn "00"
+
+    if { ${field_offset} + 2 <= ${rlen} } {
+        ## Extensions length
+        binary scan ${payload} @${field_offset}S extList_len
+        set extList_len [expr {${extList_len} & 0xffff}]
+        set field_offset [expr {${field_offset} + 2}]
+        if { ${field_offset} + ${extList_len} > ${rlen} } { return "" }
+        set ext_end [expr {${field_offset} + ${extList_len}}]
+
+        set ext_iter 0
+        while { ${field_offset} + 4 <= ${ext_end} } {
+            if { [incr ext_iter] > $static::ja4s_max_iter } { break }
+
+            ## Read the extension type as both an int (for the GREASE test) and hex.
+            binary scan ${payload} @${field_offset}S@${field_offset}H4 ext_int ext
+            if { ![info exists ext] || [string length ${ext}] != 4 } { break }
+            set ext_int [expr {${ext_int} & 0xffff}]
+            set field_offset [expr {${field_offset} + 2}]
+
+            binary scan ${payload} @${field_offset}S ext_len
+            set ext_len [expr {${ext_len} & 0xffff}]
+            set field_offset [expr {${field_offset} + 2}]
+
+            if { ${field_offset} + ${ext_len} > ${ext_end} } { break }
+
+            ## Ignore GREASE extension types - they are not counted or hashed.
+            if { ! (( ${ext_int} & 0x0f0f ) == 0x0a0a
+                    && (( ${ext_int} >> 8 ) & 0xff) == ( ${ext_int} & 0xff )) } {
+                lappend ja4s_etype_list ${ext}
+                incr ja4s_ecnt
+
+                switch $ext {
+                    "0010" {
+                        ## ALPN (16): ext data = 2-byte protocol-list length, then a
+                        ## 1-byte name length, then the name (list length unused).
+                        if { ${ext_len} >= 3 } {
+                            binary scan ${payload} @[expr {${field_offset} + 2}]c alpn_str_len
+                            set alpn_str_len [expr {${alpn_str_len} & 0xff}]
+                            if { ${alpn_str_len} > 0 \
+                                 && ${alpn_str_len} + 3 <= ${ext_len} } {
+                                binary scan ${payload} \
+                                    @[expr {${field_offset} + 3}]a${alpn_str_len} alpn_str
+                                binary scan ${payload} \
+                                    @[expr {${field_offset} + 3}]H[expr {${alpn_str_len} * 2}] alpn_hex
+                            }
+                        }
+                    }
+                    "002b" {
+                        ## Supported Versions (43) - in a ServerHello this is a single
+                        ## 2-byte selected_version with NO list/length prefix (RFC 8446).
+                        if { ${ext_len} >= 2 } {
+                            binary scan ${payload} @${field_offset}H4 ja4s_ver
+                        }
+                    }
+                }
+            }
+
+            set field_offset [expr {${field_offset} + ${ext_len}}]
+        }
+    }
+
+    if { [info exists alpn_str] && [string length ${alpn_str}] > 0 } {
+        ## Spec: first/last ASCII-alphanumeric chars of the ALPN; if either the
+        ## first or last byte is non-alphanumeric, use the hex representation.
+        set first_byte [scan [string index ${alpn_str} 0]   %c]
+        set last_byte  [scan [string index ${alpn_str} end] %c]
+        set first_ok [expr {
+            (${first_byte} >= 0x30 && ${first_byte} <= 0x39) ||
+            (${first_byte} >= 0x41 && ${first_byte} <= 0x5A) ||
+            (${first_byte} >= 0x61 && ${first_byte} <= 0x7A) }]
+        set last_ok [expr {
+            (${last_byte} >= 0x30 && ${last_byte} <= 0x39) ||
+            (${last_byte} >= 0x41 && ${last_byte} <= 0x5A) ||
+            (${last_byte} >= 0x61 && ${last_byte} <= 0x7A) }]
+        if { ${first_ok} && ${last_ok} } {
+            set ja4s_alpn "[string index ${alpn_str} 0][string index ${alpn_str} end]"
+        } else {
+            set ja4s_alpn "[string index ${alpn_hex} 0][string index ${alpn_hex} end]"
+        }
+    }
+
+    if { $ja4s_ecnt > 99 } { set ja4s_ecnt 99 }
+    set ja4s_ecnt [format "%02d" $ja4s_ecnt]
+
+    ## JA4S keeps server extensions in their ORIGINAL order (do NOT sort, unlike
+    ## the JA4 client hash).
+    set ja4s_etype_str ""
+    foreach ext_type_hex $ja4s_etype_list {
+        append ja4s_etype_str "${ext_type_hex},"
+    }
+    set ja4s_etype_str [string trimright ${ja4s_etype_str} ","]
+    if { ${ja4s_etype_str} eq "" } {
+        set ja4s_ext_hash_trunc "000000000000"
+    } else {
+        binary scan [sha256 ${ja4s_etype_str}] H* ja4s_ext_hash
+        set ja4s_ext_hash_trunc [string range ${ja4s_ext_hash} 0 11]
+    }
+
+    switch $ja4s_ver {
+        "0304" { set ja4s_ver "13" }
+        "0303" { set ja4s_ver "12" }
+        "0302" { set ja4s_ver "11" }
+        "0301" { set ja4s_ver "10" }
+        "0300" { set ja4s_ver "s3" }
+        "0002" { set ja4s_ver "s2" }
+        "feff" { set ja4s_ver "d1" }
+        "fefd" { set ja4s_ver "d2" }
+        "fefc" { set ja4s_ver "d3" }
+        default { set ja4s_ver "00" }
+    }
+
+    set ja4s_str "${ja4s_tprt}${ja4s_ver}${ja4s_ecnt}${ja4s_alpn}_${ja4s_cipher}_${ja4s_ext_hash_trunc}"
+    return "${ja4s_str}"
+}
+
+
+when SERVER_CONNECTED {
+    unset -nocomplain sh_total rlen ja4s ja4x server_ver
+    set ja4s_tprt "t"
+    ## JA4X collection on by default; set to 0 to compute JA4S only.
+    set collect_ja4x 1
+    TCP::collect
+}
+
+when SERVER_DATA {
+    set plen [TCP::payload length]
+
+    ## ---- ServerHello -> JA4S ------------------------------------------------------------
+    if { ![info exists sh_total] } {
+        if { ${plen} < 11 } { TCP::collect 11 ; return }
+        binary scan [TCP::payload] cH4ScH6H4 rtype proto_ver rlen hs_type rilen server_ver
+        set rtype    [expr {${rtype}    & 0xff}]
+        set hs_type  [expr {${hs_type}  & 0xff}]
+        ## Total ServerHello record size (record body + 5-byte record header). The JA4S
+        ## parser uses absolute offsets whose base (43) already counts the record header.
+        set sh_total [expr {(${rlen} & 0xffff) + 5}]
+        if { !( ${rtype} == 22 && ${hs_type} == 2 ) || ${sh_total} > $static::ja4s_max_record } {
+            TCP::release
+            return
+        }
+    }
+    if { ${plen} < ${sh_total} } { TCP::collect ${sh_total} ; return }
+    if { ![info exists ja4s] } {
+        set ja4s [call parseServerHello [TCP::payload] ${sh_total} ${server_ver} ${ja4s_tprt}]
+        if { ${ja4s} ne "" } {
+            log local0. "JA4S=${ja4s} src=[IP::client_addr]:[TCP::client_port]"
+        }
+    }
+
+    ## ---- Certificate -> JA4X ------------------------------------------------------------
+    ## The Certificate record follows the ServerHello record (a full handshake). On a
+    ## resumed session there is no Certificate, so this simply never fires.
+    if { ${collect_ja4x} && ![info exists ja4x] } {
+        set coff ${sh_total}
+        if { ${plen} < [expr {${coff} + 6}] } { TCP::collect [expr {${coff} + 6}] ; return }
+        binary scan [TCP::payload] @${coff}cH4Sc r2type r2proto r2len hs2_type
+        set r2type   [expr {${r2type}   & 0xff}]
+        set hs2_type [expr {${hs2_type} & 0xff}]
+        set r2len    [expr {${r2len}    & 0xffff}]
+        if { ${r2type} == 22 && ${hs2_type} == 11 } {
+            ## Buffer the leaf cert. The leaf is at the start of the Certificate message,
+            ## so collecting the first Certificate record (capped) covers it.
+            set need [expr {${coff} + 5 + ${r2len}}]
+            if { ${need} > [expr {${coff} + 5 + $static::ja4x_max_cert}] } {
+                set need [expr {${coff} + 5 + $static::ja4x_max_cert}]
+            }
+            if { ${plen} < ${need} } { TCP::collect ${need} ; return }
+            set ja4x [call parseServerCert [TCP::payload] ${coff}]
+            log local0. "JA4X=${ja4x} src=[IP::client_addr]:[TCP::client_port]"
+        }
+    }
+
+    TCP::release
+}
