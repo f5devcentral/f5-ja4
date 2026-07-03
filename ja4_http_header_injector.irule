@@ -3,27 +3,9 @@
 #
 #  Inserts the JA4+ fingerprints computed by the other JA4+ iRules as HTTP request headers.
 #
-#  Why this is a separate iRule:
-#  The JA4+ fingerprint iRules (ja4, ja4s / ja4s_x, ja4l, ja4t) can be attached to virtual
-#  servers that have NO HTTP profile. If those rules called an HTTP:: command directly, it
-#  would raise a TCL error and reset the connection on a non-HTTP virtual server. So the
-#  fingerprint rules only ever store their result in a connection variable, and ALL HTTP
-#  header injection is isolated here. Attach THIS rule only to virtual servers that have an
-#  HTTP profile.
-#
-#  Each fingerprint rule stores its result in a connection variable (below); this rule
-#  inserts the matching X-JA4* header only when that variable exists on the connection. Any
-#  client-supplied header of the same name is removed first so a client cannot spoof a
-#  fingerprint.
-#
 #  Deployment order: attach this rule AFTER the fingerprint rules. If another rule consumes
 #  a JA4 header later in HTTP_REQUEST (e.g. a JA4 reputation / ASM rule reading X-JA4), attach
 #  this rule BEFORE that consumer.
-#
-#  Note on timing: JA4, JA4L and JA4T are computed before HTTP_REQUEST, so their headers are
-#  present on every request. JA4S / JA4X come from the server handshake (SERVER_DATA), so on a
-#  brand-new connection they may not exist yet for the first request; they are injected once
-#  available (e.g. on subsequent requests over a reused client connection).
 #
 #  Copyright (c) 2024, FoxIO, LLC.
 #  All rights reserved.
