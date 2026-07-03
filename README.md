@@ -4,7 +4,7 @@ F5 iRules for generating JA4+ fingerprints.  iRules for JA4, JA4S, JA4X, JA4H, J
 
 > [!WARNING]
 >DISCLAIMER: These iRules are provided as-is with no guarantee of performance or functionality.  Use at your own risk.
->These iRules have been tested on F5 BIGIPs running TMOS versions 16.1 and 17.1.
+>These iRules have been tested on F5 BIGIPs running TMOS versions 16.1, 17.1, 17.5, and 21.1.
  
 
 ## iRules in this repository
