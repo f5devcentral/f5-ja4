@@ -1,0 +1,50 @@
+###############################################################################################
+#  iRule: ja4_http_header_injector
+#
+#  Inserts the JA4+ fingerprints computed by the other JA4+ iRules as HTTP request headers.
+#
+#  Why this is a separate iRule:
+#  The JA4+ fingerprint iRules (ja4, ja4s / ja4s_x, ja4l, ja4t) can be attached to virtual
+#  servers that have NO HTTP profile. If those rules called an HTTP:: command directly, it
+#  would raise a TCL error and reset the connection on a non-HTTP virtual server. So the
+#  fingerprint rules only ever store their result in a connection variable, and ALL HTTP
+#  header injection is isolated here. Attach THIS rule only to virtual servers that have an
+#  HTTP profile.
+#
+#  Each fingerprint rule stores its result in a connection variable (below); this rule
+#  inserts the matching X-JA4* header only when that variable exists on the connection. Any
+#  client-supplied header of the same name is removed first so a client cannot spoof a
+#  fingerprint.
+#
+#  Deployment order: attach this rule AFTER the fingerprint rules. If another rule consumes
+#  a JA4 header later in HTTP_REQUEST (e.g. a JA4 reputation / ASM rule reading X-JA4), attach
+#  this rule BEFORE that consumer.
+#
+#  Note on timing: JA4, JA4L and JA4T are computed before HTTP_REQUEST, so their headers are
+#  present on every request. JA4S / JA4X come from the server handshake (SERVER_DATA), so on a
+#  brand-new connection they may not exist yet for the first request; they are injected once
+#  available (e.g. on subsequent requests over a reused client connection).
+#
+#  Copyright (c) 2024, FoxIO, LLC.
+#  All rights reserved.
+#  Licensed under FoxIO License 1.1 (the JA4 client fingerprint is BSD 3-Clause).
+#  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
+###############################################################################################
+
+when HTTP_REQUEST {
+    # Anti-spoofing: strip any client-supplied JA4+ headers before we (re)insert them.
+    foreach hdr { X-JA4 X-JA4_r X-JA4H X-JA4H_r X-JA4S X-JA4X X-JA4L X-JA4T } {
+        HTTP::header remove ${hdr}
+    }
+
+    # Insert each fingerprint that has been computed on this connection. Each source
+    # iRule stores its result in the connection variable checked below.
+    if { [info exists ja4_fingerprint]   } { HTTP::header insert "X-JA4"    ${ja4_fingerprint}   } ;# ja4.irule
+    if { [info exists ja4_r_fingerprint] } { HTTP::header insert "X-JA4_r"  ${ja4_r_fingerprint} } ;# ja4.irule (raw)
+    if { [info exists ja4h_fp]           } { HTTP::header insert "X-JA4H"   ${ja4h_fp}           } ;# ja4h.irule
+    if { [info exists ja4hr_fp]          } { HTTP::header insert "X-JA4H_r" ${ja4hr_fp}          } ;# ja4h.irule (raw)
+    if { [info exists ja4s]              } { HTTP::header insert "X-JA4S"   ${ja4s}              } ;# ja4s.irule / ja4s_x.irule
+    if { [info exists ja4x]              } { HTTP::header insert "X-JA4X"   ${ja4x}              } ;# ja4s_x.irule
+    if { [info exists ja4l]              } { HTTP::header insert "X-JA4L"   ${ja4l}              } ;# ja4l.irule
+    if { [info exists ja4t]              } { HTTP::header insert "X-JA4T"   ${ja4t}              } ;# ja4t.irule
+}

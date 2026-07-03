@@ -62,15 +62,7 @@ when CLIENTSSL_HANDSHAKE {
     set ja4l "${ja4l_tcp_latency}_${ttl}_${ja4l_app_latency}"
 }
 
-when HTTP_REQUEST {
-    # Strip any client-supplied X-JA4L* headers first to prevent spoofing.
-    foreach jh [HTTP::header names] {
-        if { [string tolower ${jh}] starts_with "x-ja4l" } {
-            HTTP::header remove ${jh}
-        }
-    }
-
-    if { [info exists ja4l] } {
-        HTTP::header insert "X-JA4L" "${ja4l}"
-    }
-}
+# NOTE: This rule intentionally does NOT insert an X-JA4L header. It only computes
+# ${ja4l} (a connection variable); the separate ja4_http_header_injector iRule
+# performs header injection. This keeps ja4l safe to attach to a virtual server
+# that has no HTTP profile (an HTTP:: command there would reset the connection).

@@ -113,21 +113,15 @@ when HTTP_REQUEST priority 10 {
         set trunc_ckvhash "000000000000"
     }
 
-    # Generate JA4H fingerprint string
+    # Generate the JA4H fingerprint string and store it in a connection variable.
+    # This rule does NOT insert the X-JA4H header itself - header injection is
+    # handled by the separate ja4_http_header_injector iRule.
     set ja4h_fp "${me}${v}${c}${r}${hc}${lang}_${trunc_hhash}_${trunc_chash}_${trunc_ckvhash}"
-    HTTP::header insert "X-JA4H" $ja4h_fp
 
-    # If enabled, generate JA4H_r(o) raw fingerprint string. Note: we
-    # deliberately do NOT include raw cookie values (ckvstr) in this header.
-    # Cookie values frequently contain session tokens and must not be copied
-    # into an outbound header that flows to backends and logs; the hash above
-    # already covers the cookie-value dimension.
+    # If enabled, also compute the JA4H_r raw fingerprint. Note: we deliberately do
+    # NOT include raw cookie values (ckvstr); cookie values frequently contain
+    # session tokens. The cookie-value hash above already covers that dimension.
     if { ${ja4h_raw} } {
         set ja4hr_fp "${me}${v}${c}${r}${hc}${lang}_${hstr}_${cstr}"
-        set ja4h_xhdr "X-JA4H_r"
-        if { ${ja4h_original} } {
-            set ja4h_xhdr "X-JA4H_ro"
-        }
-        HTTP::header insert ${ja4h_xhdr} ${ja4hr_fp}
     }
 }

@@ -88,15 +88,7 @@ when FLOW_INIT {
     }
 }
 
-when HTTP_REQUEST {
-    # Strip any client-supplied X-JA4T* headers first to prevent spoofing.
-    foreach jh [HTTP::header names] {
-        if { [string tolower ${jh}] starts_with "x-ja4t" } {
-            HTTP::header remove ${jh}
-        }
-    }
-
-    if { [info exists ja4t] } {
-        HTTP::header insert "X-JA4T" ${ja4t}
-    }
-}
+# NOTE: This rule intentionally does NOT insert an X-JA4T header. It only computes
+# ${ja4t} (a connection variable); the separate ja4_http_header_injector iRule
+# performs header injection. This keeps ja4t safe to attach to a virtual server
+# that has no HTTP profile (an HTTP:: command there would reset the connection).
