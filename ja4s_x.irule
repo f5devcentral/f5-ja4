@@ -29,22 +29,50 @@ when RULE_INIT {
 
 ## Read the DER TLV header at absolute offset ${off}. Returns { tag_hex header_len content_len }.
 ## Handles short form and the 0x81/0x82/0x83 long-length forms (covers any real certificate).
+##
+## Safe by construction: every read is bounds-checked against the buffered payload, and on ANY
+## problem - offset past the buffer, a length field that runs off the end, an unsupported length
+## form (0x80 indefinite or 0x84+), or an element whose content would extend past the buffer - it
+## returns the poison value { "" 2 0 } (empty tag, advance 2, zero content). Callers never match
+## "" against a real tag, so a hostile or truncated certificate desynchronises harmlessly instead
+## of driving an out-of-bounds read; the JA4X call site additionally parses under `catch`.
 proc derTlv { payload off } {
+    set plen [string length ${payload}]
+    if { ${off} + 2 > ${plen} } { return [list "" 2 0] }
     binary scan ${payload} @${off}H2c tag lb
     set lb [expr {${lb} & 0xff}]
     if { ${lb} < 0x80 } {
-        return [list ${tag} 2 ${lb}]
+        set hdr 2 ; set clen ${lb}
     } elseif { ${lb} == 0x81 } {
+        if { ${off} + 3 > ${plen} } { return [list "" 2 0] }
         binary scan ${payload} @[expr {${off} + 2}]c a
-        return [list ${tag} 3 [expr {${a} & 0xff}]]
+        set hdr 3 ; set clen [expr {${a} & 0xff}]
     } elseif { ${lb} == 0x82 } {
+        if { ${off} + 4 > ${plen} } { return [list "" 2 0] }
         binary scan ${payload} @[expr {${off} + 2}]S a
-        return [list ${tag} 4 [expr {${a} & 0xffff}]]
+        set hdr 4 ; set clen [expr {${a} & 0xffff}]
     } elseif { ${lb} == 0x83 } {
+        if { ${off} + 5 > ${plen} } { return [list "" 2 0] }
         binary scan ${payload} @[expr {${off} + 2}]cS a b
-        return [list ${tag} 5 [expr {((${a} & 0xff) << 16) | (${b} & 0xffff)}]]
+        set hdr 5 ; set clen [expr {((${a} & 0xff) << 16) | (${b} & 0xffff)}]
+    } else {
+        ## 0x80 (BER indefinite) and 0x84..0xFF long forms are invalid in a DER certificate
+        ## and are not supported - treat the element as unparseable rather than guessing.
+        return [list "" 2 0]
     }
-    return [list ${tag} 2 0]
+    ## Reject any element whose header+content would run past the buffered payload.
+    if { ${off} + ${hdr} + ${clen} > ${plen} } { return [list "" 2 0] }
+    return [list ${tag} ${hdr} ${clen}]
+}
+
+## Peek the 1-byte tag at absolute offset ${off} as hex, or "" if the offset is past the
+## buffered payload. Used for optional-element detection so a truncated certificate leaves an
+## empty (never unset) tag rather than throwing an uncaught error / resetting the connection.
+proc peekTag { payload off } {
+    if { ${off} + 1 > [string length ${payload}] } { return "" }
+    binary scan ${payload} @${off}H2 tag
+    if { ![info exists tag] } { return "" }
+    return ${tag}
 }
 
 ## Hash an ordered list of OID hex strings the JA4X way: sha256 of the comma-joined list,
@@ -59,6 +87,7 @@ proc ja4xHash { oids } {
 ## length ${len}; return the attribute-type OIDs (content bytes, hex) in order. Handles
 ## multi-valued RDNs (more than one AttributeTypeAndValue per SET).
 proc parseName { payload start len } {
+    set plen [string length ${payload}]
     set end  [expr {${start} + ${len}}]
     set oids [list]
     set fo   ${start}
@@ -78,8 +107,15 @@ proc parseName { payload start len } {
             set afo       [expr {${atv_inner} + [lindex ${at} 2]}]
             set ot      [call derTlv ${payload} ${atv_inner}]
             set oid_off [expr {${atv_inner} + [lindex ${ot} 1]}]
-            binary scan ${payload} @${oid_off}H[expr {[lindex ${ot} 2] * 2}] oidhex
-            lappend oids ${oidhex}
+            set oid_len [lindex ${ot} 2]
+            ## Bound the OID read: real attribute-type OIDs are a handful of bytes. Cap the
+            ## length and require it to lie within the buffer, so a crafted OID length can
+            ## neither read past the payload (unset var -> connection reset) nor drive an
+            ## overlapping multi-KB read (CPU/memory amplification). Malformed OIDs are skipped.
+            if { ${oid_len} >= 1 && ${oid_len} <= 64 && ${oid_off} + ${oid_len} <= ${plen} } {
+                binary scan ${payload} @${oid_off}H[expr {${oid_len} * 2}] oidhex
+                lappend oids ${oidhex}
+            }
         }
     }
     return ${oids}
@@ -89,11 +125,11 @@ proc parseName { payload start len } {
 ## JA4X fingerprint: issuerHash_subjectHash_extensionHash. ${offset} is the absolute offset
 ## of the Certificate TLS record header (0x16 ...).
 proc parseServerCert { payload offset } {
+    set plen [string length ${payload}]
     ## Skip: record hdr(5) + hs type(1) + hs len(3) + certificate_list len(3) = 12
     set fo [expr {${offset} + 12}]
-    ## Leaf certificate length (3 bytes); the leaf DER begins right after.
-    binary scan ${payload} @${fo}H6 cl
-    scan ${cl} %x cert_len
+    ## Skip the 3-byte leaf certificate length; the leaf DER begins right after. (The value
+    ## itself is unused - derTlv reads the leaf SEQUENCE's own length field.)
     incr fo 3
 
     ## Certificate ::= SEQUENCE  ->  tbsCertificate ::= SEQUENCE (descend into both)
@@ -101,7 +137,7 @@ proc parseServerCert { payload offset } {
     set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1]}]
 
     ## version [0] EXPLICIT (tag a0) - optional (absent for v1); skip whole element if present
-    binary scan ${payload} @${fo}H2 tag
+    set tag [call peekTag ${payload} ${fo}]
     if { ${tag} eq "a0" } {
         set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
     }
@@ -127,14 +163,14 @@ proc parseServerCert { payload offset } {
     set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
 
     ## optional issuerUniqueID [1] (81) / subjectUniqueID [2] (82) - skip if present
-    binary scan ${payload} @${fo}H2 tag
+    set tag [call peekTag ${payload} ${fo}]
     if { ${tag} eq "81" } {
         set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
-        binary scan ${payload} @${fo}H2 tag
+        set tag [call peekTag ${payload} ${fo}]
     }
     if { ${tag} eq "82" } {
         set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
-        binary scan ${payload} @${fo}H2 tag
+        set tag [call peekTag ${payload} ${fo}]
     }
 
     ## extensions [3] EXPLICIT (tag a3) -> SEQUENCE OF Extension - collect each extnID OID
@@ -153,8 +189,12 @@ proc parseServerCert { payload offset } {
             ## first element of the Extension is the extnID OBJECT IDENTIFIER
             set ot      [call derTlv ${payload} ${ext_inner}]
             set oid_off [expr {${ext_inner} + [lindex ${ot} 1]}]
-            binary scan ${payload} @${oid_off}H[expr {[lindex ${ot} 2] * 2}] oidhex
-            lappend ext_oids ${oidhex}
+            set oid_len [lindex ${ot} 2]
+            ## Bound the extnID read exactly as in parseName (cap length, keep within buffer).
+            if { ${oid_len} >= 1 && ${oid_len} <= 64 && ${oid_off} + ${oid_len} <= ${plen} } {
+                binary scan ${payload} @${oid_off}H[expr {${oid_len} * 2}] oidhex
+                lappend ext_oids ${oidhex}
+            }
         }
     }
 
@@ -361,8 +401,13 @@ when SERVER_DATA {
                 set need [expr {${coff} + 5 + $static::ja4x_max_cert}]
             }
             if { ${plen} < ${need} } { TCP::collect ${need} ; return }
-            set ja4x [call parseServerCert [TCP::payload] ${coff}]
-            log local0. "JA4X=${ja4x} src=[IP::client_addr]:[TCP::client_port]"
+            ## Parse under catch: a hostile or truncated certificate must never abort the
+            ## SERVER_DATA event (which would RST the flow). On any parse error, skip JA4X.
+            if { [catch { call parseServerCert [TCP::payload] ${coff} } ja4x] } {
+                unset -nocomplain ja4x
+            } else {
+                log local0. "JA4X=${ja4x} src=[IP::client_addr]:[TCP::client_port]"
+            }
         }
     }
 

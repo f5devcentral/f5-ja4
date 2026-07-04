@@ -166,12 +166,14 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
 when SERVER_CONNECTED {
     unset -nocomplain rlen
     unset -nocomplain ja4s
+    unset -nocomplain server_ver
     set ja4s_tprt "t"
     TCP::collect
 }
 
 when SERVER_DATA {
 
+    # Parse the record header once, on the first SERVER_DATA for this connection.
     if { ! [info exists rlen] } {
         if { [TCP::payload length] < 43 } {
             TCP::collect 43
@@ -190,29 +192,29 @@ when SERVER_DATA {
         set rlen    [expr {(${rlen}   & 0xffff) + 5}]
         set hs_type [expr {${hs_type} & 0xff}]
 
-        if { ${rlen} > $static::ja4s_max_record } {
+        # Only a ServerHello handshake record is fingerprinted; release anything else.
+        if { !( ${rtype} == 22 && ${hs_type} == 2 ) || ${rlen} > $static::ja4s_max_record } {
             TCP::release
             return
         }
-
-        if { ( ${rtype} == 22 ) && ( ${hs_type} == 2 ) } {
-            if { [TCP::payload length] >= ${rlen} } {
-                set ja4s [call parseServerHello [TCP::payload] ${rlen} ${server_ver} ${ja4s_tprt}]
-                if { ${ja4s} ne "" } {
-                    log local0. "JA4S=${ja4s} src=[IP::client_addr]:[TCP::client_port]"
-                }
-            }
-        }
     }
 
-    # Collect the rest of the record if necessary, capped at the record max.
-    if { [TCP::payload length] < $rlen } {
-        set need $rlen
-        if { ${need} > $static::ja4s_max_record } {
-            set need $static::ja4s_max_record
-        }
-        TCP::collect ${need}
+    # Buffer the full ServerHello record before parsing (rlen is already capped at the
+    # record max above, so this collect target is bounded). A ServerHello split across TCP
+    # segments re-enters here until the whole record has arrived.
+    if { [TCP::payload length] < ${rlen} } {
+        TCP::collect ${rlen}
         return
+    }
+
+    # Compute JA4S once, OUTSIDE the header-parse guard, so a ServerHello that spanned
+    # multiple segments is still fingerprinted on re-entry (the previous version only parsed
+    # inside the parse-once block, so a segmented ServerHello was silently never computed).
+    if { ![info exists ja4s] } {
+        set ja4s [call parseServerHello [TCP::payload] ${rlen} ${server_ver} ${ja4s_tprt}]
+        if { ${ja4s} ne "" } {
+            log local0. "JA4S=${ja4s} src=[IP::client_addr]:[TCP::client_port]"
+        }
     }
 
     TCP::release

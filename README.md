@@ -59,6 +59,30 @@ To understand how to read JA4+ fingerprints, see [Technical Details](https://git
 >Licensed under FoxIO License 1.1
 >For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4_
 
+## Security considerations
+
+These points are about how JA4+ fingerprints can and cannot be used safely as a security control. They are properties of the JA4+ methods (and of the BIG-IP TCP/TLS stack), not defects in these iRules.
+
+### Treat JA4/JA4S/JA4T as a reputation signal, not an authenticator
+
+Every field of JA4 (from the ClientHello), JA4S (from the ServerHello) and JA4T (from the TCP SYN) is derived entirely from bytes the remote peer controls. Consequently:
+
+- **A denylist is evadable.** A peer that fully controls its handshake can add or drop a real cipher/extension, add a TCP NOP option, reorder options, or nudge its advertised window — changing its fingerprint while keeping a working connection — to move off an exact-match blocklist entry. (These iRules already neutralise the *cheap* evasions JA4 is designed to resist: JA4 sorts ciphers/extensions and filters GREASE, so mere reordering or GREASE injection does **not** change the fingerprint.)
+- **An allowlist / authenticator is impersonatable.** Because each fingerprint is a deterministic function of peer-controlled bytes, an attacker can replay a target client's cipher/extension set (or a target stack's SYN options) and reproduce that JA4/JA4T byte-for-byte.
+
+Use these fingerprints for correlation, threat-hunting, and reputation/risk scoring in combination with other signals — **not** as a standalone allow/deny decision or as proof of identity.
+
+### JA4T blocking and blocklist sourcing
+
+`ja4t.irule` can optionally drop connections whose JA4T matches a BIG-IP data group (`ja4t_blocking` is **off by default**; blocking uses an exact `class match ... equals`). Two things to know before relying on it:
+
+- **Source the blocklist from this iRule's own JA4T output.** `[DATAGRAM::tcp option]` on BIG-IP does not return TCP option kind `0` (End-of-Option-List / EOL), so for a SYN that carries an explicit EOL this iRule computes a JA4T that differs from one produced by a spec-compliant, EOL-counting tool (FoxIO/Wireshark/Zeek/tcpdump-based tooling). A blocklist entry taken from such a tool may therefore never match (the block silently fails open for that entry). Build the blocklist from values these iRules log, or from a parser that also omits EOL. (The same class of cross-tool difference applies to duplicate MSS/window-scale options and to the 32-option cap.)
+- **Blocking fails open by design.** If `ja4t_blocking` is enabled but the data group is missing, connections are forwarded (an unavailable blocklist should not black-hole all traffic). Ensure the data group exists and is a *string* class populated with JA4T values.
+
+### Anti-spoofing of `X-JA4*` headers
+
+`ja4h.irule` and `ja4_http_header_injector.irule` strip any client-supplied `X-JA4*` request header (prefix match) before (re)inserting the values computed on the BIG-IP, so a client cannot spoof the fingerprint a backend sees. If you consume these headers on the pool member, make sure the traffic reaches the backend **through** the injector (or the fingerprint rules), and do not trust `X-JA4*` headers arriving from any path that bypasses them.
+
 ## How to Use
 
 **Coming Soon**
