@@ -14,30 +14,20 @@
 ###############################################################################################
 
 when HTTP_REQUEST {
-    # Anti-spoofing: strip ANY client-supplied X-JA4* header (prefix match, not just the fixed
-    # set this rule emits) so a client cannot smuggle a JA4-family header - including variant
-    # names such as X-JA4SSH or X-JA4S_r - to the backend. This matches ja4h.irule's strip, so
-    # the boundary is complete even in deployments where this injector runs without ja4h.
+    # Anti-spoofing: strip any client-supplied X-JA4* header (prefix match) before (re)inserting.
     foreach hdr [HTTP::header names] {
         if { [string tolower ${hdr}] starts_with "x-ja4" } {
             HTTP::header remove ${hdr}
         }
     }
 
-    # Insert each fingerprint that has been computed on this connection. Each source
-    # iRule stores its result in the connection variable checked below.
-    # Defense-in-depth: strip any CR/LF from the two values that embed attacker-controlled
-    # text - ja4h_fp carries the Accept-Language-derived "lang", and ja4hr_fp carries raw
-    # request header names and cookie names. HTTP/1.1 parsing already rejects CR/LF in header
-    # fields, but sanitizing here removes any dependence on the HTTP/2->HTTP/1.1 translation
-    # path also rejecting it, so a crafted field/cookie name can never split into an extra
-    # header toward the pool member. The remaining values are hex/enumerated and CR/LF-free.
-    if { [info exists ja4_fingerprint]   } { HTTP::header insert "X-JA4"    ${ja4_fingerprint}   } ;# ja4.irule
-    if { [info exists ja4_r_fingerprint] } { HTTP::header insert "X-JA4_r"  ${ja4_r_fingerprint} } ;# ja4.irule (raw)
-    if { [info exists ja4h_fp]           } { HTTP::header insert "X-JA4H"   [string map [list "\r" "" "\n" ""] ${ja4h_fp}]  } ;# ja4h.irule
-    if { [info exists ja4hr_fp]          } { HTTP::header insert "X-JA4H_r" [string map [list "\r" "" "\n" ""] ${ja4hr_fp}] } ;# ja4h.irule (raw)
-    if { [info exists ja4s]              } { HTTP::header insert "X-JA4S"   ${ja4s}              } ;# ja4s.irule / ja4s_x.irule
-    if { [info exists ja4x]              } { HTTP::header insert "X-JA4X"   ${ja4x}              } ;# ja4s_x.irule
-    if { [info exists ja4l]              } { HTTP::header insert "X-JA4L"   ${ja4l}              } ;# ja4l.irule
-    if { [info exists ja4t]              } { HTTP::header insert "X-JA4T"   ${ja4t}              } ;# ja4t.irule
+    # Insert the client-side fingerprints computed on this connection. JA4S/JA4X are
+    # server-side telemetry and are intentionally not injected into the client request.
+    # CR/LF is stripped from the JA4H values, which embed client header and cookie names.
+    if { [info exists ja4_fingerprint]   } { HTTP::header insert "X-JA4"    ${ja4_fingerprint}   }
+    if { [info exists ja4_r_fingerprint] } { HTTP::header insert "X-JA4_r"  ${ja4_r_fingerprint} }
+    if { [info exists ja4h_fp]           } { HTTP::header insert "X-JA4H"   [string map [list "\r" "" "\n" ""] ${ja4h_fp}]  }
+    if { [info exists ja4hr_fp]          } { HTTP::header insert "X-JA4H_r" [string map [list "\r" "" "\n" ""] ${ja4hr_fp}] }
+    if { [info exists ja4l]              } { HTTP::header insert "X-JA4L"   ${ja4l}              }
+    if { [info exists ja4t]              } { HTTP::header insert "X-JA4T"   ${ja4t}              }
 }

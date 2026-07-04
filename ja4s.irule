@@ -11,7 +11,6 @@
 ###############################################################################################
 
 when RULE_INIT {
-    # Maximum ServerHello record size we will buffer.
     set static::ja4s_max_record 17408
     set static::ja4s_max_iter 256
 }
@@ -23,33 +22,32 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
         set rlen ${plen}
     }
 
-    ## HEADERS - SKIP: record header(5) + hs header(4) + server_version(2) + random(32) = 43
+    ## Skip record header(5) + hs header(4) + server_version(2) + random(32) = 43
     set field_offset 43
     if { ${field_offset} >= ${rlen} } { return "" }
 
-    ## SESSION ID - SKIP
+    ## Session ID - skip
     binary scan ${payload} @${field_offset}c sessID_len
     if { ![info exists sessID_len] } { return "" }
     set sessID_len [expr {${sessID_len} & 0xff}]
     set field_offset [expr {${field_offset} + 1 + ${sessID_len}}]
     if { ${field_offset} + 2 > ${rlen} } { return "" }
 
-    ## SERVER CIPHER
+    ## Server cipher
     binary scan ${payload} @${field_offset}H4 ja4s_cipher
     if { ![info exists ja4s_cipher] || [string length ${ja4s_cipher}] != 4 } { return "" }
     set field_offset [expr {${field_offset} + 2}]
 
-    ## COMPRESSION METHOD - SKIP (single byte)
+    ## Compression method - skip
     if { ${field_offset} + 1 > ${rlen} } { return "" }
     set field_offset [expr {${field_offset} + 1}]
 
-    ## EXTENSIONS
+    ## Extensions
     set ja4s_ecnt 0
     set ja4s_etype_list [list]
     set ja4s_alpn "00"
 
     if { ${field_offset} + 2 <= ${rlen} } {
-        ## Extensions length
         binary scan ${payload} @${field_offset}S extList_len
         set extList_len [expr {${extList_len} & 0xffff}]
         set field_offset [expr {${field_offset} + 2}]
@@ -60,7 +58,7 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
         while { ${field_offset} + 4 <= ${ext_end} } {
             if { [incr ext_iter] > $static::ja4s_max_iter } { break }
 
-            ## Read the extension type as both an int (for the GREASE test) and hex.
+            ## extension type as both int (GREASE test) and hex
             binary scan ${payload} @${field_offset}S@${field_offset}H4 ext_int ext
             if { ![info exists ext] || [string length ${ext}] != 4 } { break }
             set ext_int [expr {${ext_int} & 0xffff}]
@@ -72,7 +70,7 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
 
             if { ${field_offset} + ${ext_len} > ${ext_end} } { break }
 
-            ## Ignore GREASE extension types - they are not counted or hashed.
+            ## ignore GREASE extension types
             if { ! (( ${ext_int} & 0x0f0f ) == 0x0a0a
                     && (( ${ext_int} >> 8 ) & 0xff) == ( ${ext_int} & 0xff )) } {
                 lappend ja4s_etype_list ${ext}
@@ -80,8 +78,7 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
 
                 switch $ext {
                     "0010" {
-                        ## ALPN (16): ext data = 2-byte protocol-list length, then a
-                        ## 1-byte name length, then the name (list length unused).
+                        ## ALPN: 2-byte list length, 1-byte name length, then the name
                         if { ${ext_len} >= 3 } {
                             binary scan ${payload} @[expr {${field_offset} + 2}]c alpn_str_len
                             set alpn_str_len [expr {${alpn_str_len} & 0xff}]
@@ -95,8 +92,7 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
                         }
                     }
                     "002b" {
-                        ## Supported Versions (43) - in a ServerHello this is a single
-                        ## 2-byte selected_version with NO list/length prefix (RFC 8446).
+                        ## Supported Versions: single 2-byte selected_version in a ServerHello
                         if { ${ext_len} >= 2 } {
                             binary scan ${payload} @${field_offset}H4 ja4s_ver
                         }
@@ -109,8 +105,7 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
     }
 
     if { [info exists alpn_str] && [string length ${alpn_str}] > 0 } {
-        ## Spec: first/last ASCII-alphanumeric chars of the ALPN; if either the
-        ## first or last byte is non-alphanumeric, use the hex representation.
+        ## ALPN value = first/last alphanumeric chars, else the hex representation
         set first_byte [scan [string index ${alpn_str} 0]   %c]
         set last_byte  [scan [string index ${alpn_str} end] %c]
         set first_ok [expr {
@@ -131,8 +126,7 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
     if { $ja4s_ecnt > 99 } { set ja4s_ecnt 99 }
     set ja4s_ecnt [format "%02d" $ja4s_ecnt]
 
-    ## JA4S keeps server extensions in their ORIGINAL order (do NOT sort, unlike
-    ## the JA4 client hash).
+    ## JA4S keeps server extensions in their ORIGINAL order (do not sort)
     set ja4s_etype_str ""
     foreach ext_type_hex $ja4s_etype_list {
         append ja4s_etype_str "${ext_type_hex},"
@@ -173,7 +167,7 @@ when SERVER_CONNECTED {
 
 when SERVER_DATA {
 
-    # Parse the record header once, on the first SERVER_DATA for this connection.
+    ## Parse the record header once, on the first SERVER_DATA for this connection.
     if { ! [info exists rlen] } {
         if { [TCP::payload length] < 43 } {
             TCP::collect 43
@@ -185,31 +179,24 @@ when SERVER_DATA {
             return
         }
         set rtype   [expr {${rtype}   & 0xff}]
-        # rlen is the TLS record BODY length (bytes[3:4]); add the 5-byte record
-        # header so rlen represents the TOTAL record size. parseServerHello uses
-        # absolute field offsets whose base (43) already counts the 5-byte header,
-        # and the TCP::collect target below needs the full record, not just body.
+        ## rlen = record body length; add the 5-byte header for the total record size.
         set rlen    [expr {(${rlen}   & 0xffff) + 5}]
         set hs_type [expr {${hs_type} & 0xff}]
 
-        # Only a ServerHello handshake record is fingerprinted; release anything else.
+        ## Only a ServerHello handshake record is fingerprinted; release anything else.
         if { !( ${rtype} == 22 && ${hs_type} == 2 ) || ${rlen} > $static::ja4s_max_record } {
             TCP::release
             return
         }
     }
 
-    # Buffer the full ServerHello record before parsing (rlen is already capped at the
-    # record max above, so this collect target is bounded). A ServerHello split across TCP
-    # segments re-enters here until the whole record has arrived.
+    ## Buffer the full ServerHello record (rlen already capped above), then parse.
     if { [TCP::payload length] < ${rlen} } {
         TCP::collect ${rlen}
         return
     }
 
-    # Compute JA4S once, OUTSIDE the header-parse guard, so a ServerHello that spanned
-    # multiple segments is still fingerprinted on re-entry (the previous version only parsed
-    # inside the parse-once block, so a segmented ServerHello was silently never computed).
+    ## Compute JA4S once, outside the header-parse guard, so a segmented ServerHello still parses.
     if { ![info exists ja4s] } {
         set ja4s [call parseServerHello [TCP::payload] ${rlen} ${server_ver} ${ja4s_tprt}]
         if { ${ja4s} ne "" } {

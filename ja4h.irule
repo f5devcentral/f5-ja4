@@ -11,28 +11,25 @@
 ###############################################################################################
 
 when RULE_INIT {
-    # Maximum Accept-Language bytes we are willing to inspect. Anything longer
-    # is truncated before the regex to prevent CPU amplification.
+    # Max Accept-Language bytes inspected (truncated before regex to bound CPU).
     set static::ja4h_max_al 64
 }
 
 when CLIENT_ACCEPTED {
-    # Use these variables to define the -r (raw) and -o (original) switches defined in the JA4 spec
-    # 0 = false/disabled (default) and 1 = true/enabled
+    # JA4 spec -r (raw) and -o (original) switches: 0 = disabled (default), 1 = enabled
     set ja4h_raw 1
     set ja4h_original 0
 }
 
 when HTTP_REQUEST priority 10 {
-    # Strip any client-supplied X-JA4H* headers so a client cannot spoof the
-    # fingerprint that the backend sees.
+    # Anti-spoofing: strip any client-supplied X-JA4* header.
     foreach jh [HTTP::header names] {
         if { [string tolower ${jh}] starts_with "x-ja4" } {
             HTTP::header remove ${jh}
         }
     }
 
-    # Collect JA4H "a" values
+    # JA4H "a" values
     set me [string range [string tolower [HTTP::method]] 0 1]
     set v  [string map {"." ""} [HTTP::version]]
     set c  "n"
@@ -47,14 +44,10 @@ when HTTP_REQUEST priority 10 {
     set lang "0000"
     set alval [HTTP::header value "accept-language"]
     if { ${alval} ne "" } {
-        # Cap length before any regex/string work (CPU amplification guard).
         if { [string length ${alval}] > $static::ja4h_max_al } {
             set alval [string range ${alval} 0 [expr {$static::ja4h_max_al - 1}]]
         }
-        # Reference JA4H: strip "-", map ";"->",", lowercase, take the first
-        # comma-delimited token, then its first 4 characters (the "0000" seed
-        # supplies right-padding). No hex-encoding: digits and other characters
-        # are kept verbatim per the reference implementation.
+        # strip "-", map ";"->",", lowercase, take the first token's first 4 chars
         set alval [string tolower [string map {"-" "" ";" ","} ${alval}]]
         set alval [string range [lindex [split ${alval} ","] 0] 0 3]
         if { [string length ${alval}] > 0 } {
@@ -62,16 +55,11 @@ when HTTP_REQUEST priority 10 {
         }
     }
 
-    # Collect JA4H "b" values
+    # JA4H "b" values (header list/count, excluding HTTP/2 pseudo-headers, Cookie*, Referer)
     set hc 0
     set hstr ""
     foreach hname [HTTP::header names] {
         set hl [string tolower ${hname}]
-        # Exclude HTTP/2 pseudo-headers (":authority", ":method", ...), Cookie
-        # (prefix match, e.g. "Cookie2") and Referer from the header list/count,
-        # matching the reference - and regardless of the original-order flag
-        # (the reference never puts Cookie/Referer in the header list). Client-
-        # supplied X-JA4* headers were already stripped above.
         if { ([string index ${hname} 0] eq ":") \
              || [string match "cookie*" ${hl}] || (${hl} eq "referer") } {
             continue
@@ -86,7 +74,7 @@ when HTTP_REQUEST priority 10 {
     binary scan [sha256 ${hstr}] H* hhash
     set trunc_hhash [string range $hhash 0 11]
 
-    # Collect JA4H "c" and "d" values
+    # JA4H "c" and "d" values (cookie names, and cookie name=value)
     set cstr   ""
     set clist  [list]
     set ckvstr ""
@@ -113,14 +101,11 @@ when HTTP_REQUEST priority 10 {
         set trunc_ckvhash "000000000000"
     }
 
-    # Generate the JA4H fingerprint string and store it in a connection variable.
-    # This rule does NOT insert the X-JA4H header itself - header injection is
-    # handled by the separate ja4_http_header_injector iRule.
+    # Store the fingerprint in a connection variable (ja4_http_header_injector inserts the header).
     set ja4h_fp "${me}${v}${c}${r}${hc}${lang}_${trunc_hhash}_${trunc_chash}_${trunc_ckvhash}"
 
-    # If enabled, also compute the JA4H_r raw fingerprint. Note: we deliberately do
-    # NOT include raw cookie values (ckvstr); cookie values frequently contain
-    # session tokens. The cookie-value hash above already covers that dimension.
+    # Raw fingerprint. Raw cookie values (ckvstr) are deliberately excluded - they often
+    # carry session tokens; the cookie-value hash above already covers that dimension.
     if { ${ja4h_raw} } {
         set ja4hr_fp "${me}${v}${c}${r}${hc}${lang}_${hstr}_${cstr}"
     }

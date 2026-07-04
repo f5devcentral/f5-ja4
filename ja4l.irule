@@ -11,8 +11,7 @@
 ###############################################################################################
 
 when RULE_INIT {
-    # Upper bound for a reported latency value (microseconds). Anything above
-    # this is treated as clock noise and clamped.
+    # Upper bound (microseconds) for a reported latency; above this is clamped as clock noise.
     set static::ja4l_max_latency 10000000
 }
 
@@ -62,7 +61,5 @@ when CLIENTSSL_HANDSHAKE {
     set ja4l "${ja4l_tcp_latency}_${ttl}_${ja4l_app_latency}"
 }
 
-# NOTE: This rule intentionally does NOT insert an X-JA4L header. It only computes
-# ${ja4l} (a connection variable); the separate ja4_http_header_injector iRule
-# performs header injection. This keeps ja4l safe to attach to a virtual server
-# that has no HTTP profile (an HTTP:: command there would reset the connection).
+# NOTE: This rule only computes ${ja4l} (a connection variable); ja4_http_header_injector
+# inserts the header. This keeps ja4l safe on a virtual server with no HTTP profile.

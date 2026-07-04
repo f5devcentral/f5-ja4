@@ -18,9 +18,7 @@
 when RULE_INIT {
     set static::ja4s_max_record 17408
     set static::ja4s_max_iter   256
-    # Max bytes of the Certificate record we will buffer to reach the leaf cert.
     set static::ja4x_max_cert   17408
-    # Loop guards for DER walking (RDNs per Name, extensions per cert).
     set static::ja4x_max_rdn    64
     set static::ja4x_max_ext    64
 }
@@ -28,14 +26,8 @@ when RULE_INIT {
 ## ------------------------------------------------------------------- DER helpers (JA4X)
 
 ## Read the DER TLV header at absolute offset ${off}. Returns { tag_hex header_len content_len }.
-## Handles short form and the 0x81/0x82/0x83 long-length forms (covers any real certificate).
-##
-## Safe by construction: every read is bounds-checked against the buffered payload, and on ANY
-## problem - offset past the buffer, a length field that runs off the end, an unsupported length
-## form (0x80 indefinite or 0x84+), or an element whose content would extend past the buffer - it
-## returns the poison value { "" 2 0 } (empty tag, advance 2, zero content). Callers never match
-## "" against a real tag, so a hostile or truncated certificate desynchronises harmlessly instead
-## of driving an out-of-bounds read; the JA4X call site additionally parses under `catch`.
+## Bounds-safe: on any out-of-range read, unsupported length form (0x80/0x84+), or overrun it
+## returns the poison value { "" 2 0 } so callers desynchronise harmlessly instead of reading OOB.
 proc derTlv { payload off } {
     set plen [string length ${payload}]
     if { ${off} + 2 > ${plen} } { return [list "" 2 0] }
@@ -56,18 +48,13 @@ proc derTlv { payload off } {
         binary scan ${payload} @[expr {${off} + 2}]cS a b
         set hdr 5 ; set clen [expr {((${a} & 0xff) << 16) | (${b} & 0xffff)}]
     } else {
-        ## 0x80 (BER indefinite) and 0x84..0xFF long forms are invalid in a DER certificate
-        ## and are not supported - treat the element as unparseable rather than guessing.
         return [list "" 2 0]
     }
-    ## Reject any element whose header+content would run past the buffered payload.
     if { ${off} + ${hdr} + ${clen} > ${plen} } { return [list "" 2 0] }
     return [list ${tag} ${hdr} ${clen}]
 }
 
-## Peek the 1-byte tag at absolute offset ${off} as hex, or "" if the offset is past the
-## buffered payload. Used for optional-element detection so a truncated certificate leaves an
-## empty (never unset) tag rather than throwing an uncaught error / resetting the connection.
+## Peek the 1-byte tag at ${off} as hex, or "" if past the buffer (safe optional-element check).
 proc peekTag { payload off } {
     if { ${off} + 1 > [string length ${payload}] } { return "" }
     binary scan ${payload} @${off}H2 tag
@@ -75,17 +62,13 @@ proc peekTag { payload off } {
     return ${tag}
 }
 
-## Hash an ordered list of OID hex strings the JA4X way: sha256 of the comma-joined list,
-## truncated to 12 hex chars. NOTE: JA4X does NOT special-case the empty list (unlike JA4S),
-## so an empty issuer/subject/extension list hashes the empty string -> e3b0c44298fc.
+## sha256 of the comma-joined OID list, truncated to 12 hex chars (empty list -> e3b0c44298fc).
 proc ja4xHash { oids } {
     binary scan [sha256 [join ${oids} ","]] H* h
     return [string range ${h} 0 11]
 }
 
-## Parse a DER Name (SEQUENCE OF RelativeDistinguishedName) at value offset ${start} of
-## length ${len}; return the attribute-type OIDs (content bytes, hex) in order. Handles
-## multi-valued RDNs (more than one AttributeTypeAndValue per SET).
+## Parse a DER Name at value offset ${start} length ${len}; return the attribute-type OIDs in order.
 proc parseName { payload start len } {
     set plen [string length ${payload}]
     set end  [expr {${start} + ${len}}]
@@ -108,10 +91,7 @@ proc parseName { payload start len } {
             set ot      [call derTlv ${payload} ${atv_inner}]
             set oid_off [expr {${atv_inner} + [lindex ${ot} 1]}]
             set oid_len [lindex ${ot} 2]
-            ## Bound the OID read: real attribute-type OIDs are a handful of bytes. Cap the
-            ## length and require it to lie within the buffer, so a crafted OID length can
-            ## neither read past the payload (unset var -> connection reset) nor drive an
-            ## overlapping multi-KB read (CPU/memory amplification). Malformed OIDs are skipped.
+            ## Bound the OID read (cap length, keep within buffer) to avoid OOB reads and amplification.
             if { ${oid_len} >= 1 && ${oid_len} <= 64 && ${oid_off} + ${oid_len} <= ${plen} } {
                 binary scan ${payload} @${oid_off}H[expr {${oid_len} * 2}] oidhex
                 lappend oids ${oidhex}
@@ -121,32 +101,29 @@ proc parseName { payload start len } {
     return ${oids}
 }
 
-## Parse the FIRST (leaf) certificate in a TLS Certificate handshake message and return the
-## JA4X fingerprint: issuerHash_subjectHash_extensionHash. ${offset} is the absolute offset
-## of the Certificate TLS record header (0x16 ...).
+## Parse the leaf certificate and return the JA4X fingerprint issuerHash_subjectHash_extHash.
+## ${offset} is the absolute offset of the Certificate TLS record header.
 proc parseServerCert { payload offset } {
     set plen [string length ${payload}]
-    ## Skip: record hdr(5) + hs type(1) + hs len(3) + certificate_list len(3) = 12
+    ## Skip record hdr(5) + hs type(1) + hs len(3) + certificate_list len(3) + leaf len(3) = 15
     set fo [expr {${offset} + 12}]
-    ## Skip the 3-byte leaf certificate length; the leaf DER begins right after. (The value
-    ## itself is unused - derTlv reads the leaf SEQUENCE's own length field.)
     incr fo 3
 
-    ## Certificate ::= SEQUENCE  ->  tbsCertificate ::= SEQUENCE (descend into both)
+    ## Certificate SEQUENCE -> tbsCertificate SEQUENCE (descend into both)
     set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1]}]
     set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1]}]
 
-    ## version [0] EXPLICIT (tag a0) - optional (absent for v1); skip whole element if present
+    ## version [0] EXPLICIT (a0) - optional, skip if present
     set tag [call peekTag ${payload} ${fo}]
     if { ${tag} eq "a0" } {
         set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
     }
     ## serialNumber INTEGER - skip
     set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
-    ## signature AlgorithmIdentifier SEQUENCE - skip whole element (algorithm-agnostic)
+    ## signature AlgorithmIdentifier - skip
     set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
 
-    ## issuer Name - collect RDN OIDs, then advance past it
+    ## issuer Name - collect RDN OIDs
     set t [call derTlv ${payload} ${fo}]
     set issuer_oids [call parseName ${payload} [expr {${fo} + [lindex ${t} 1]}] [lindex ${t} 2]]
     set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
@@ -154,7 +131,7 @@ proc parseServerCert { payload offset } {
     ## validity SEQUENCE - skip
     set t [call derTlv ${payload} ${fo}] ; set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
 
-    ## subject Name - collect RDN OIDs, then advance past it
+    ## subject Name - collect RDN OIDs
     set t [call derTlv ${payload} ${fo}]
     set subject_oids [call parseName ${payload} [expr {${fo} + [lindex ${t} 1]}] [lindex ${t} 2]]
     set fo [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
@@ -173,24 +150,22 @@ proc parseServerCert { payload offset } {
         set tag [call peekTag ${payload} ${fo}]
     }
 
-    ## extensions [3] EXPLICIT (tag a3) -> SEQUENCE OF Extension - collect each extnID OID
+    ## extensions [3] EXPLICIT (a3) -> SEQUENCE OF Extension - collect each extnID OID
     set ext_oids [list]
     if { ${tag} eq "a3" } {
-        set t [call derTlv ${payload} ${fo}]           ;# [3] EXPLICIT
+        set t [call derTlv ${payload} ${fo}]
         set fo [expr {${fo} + [lindex ${t} 1]}]
-        set t [call derTlv ${payload} ${fo}]           ;# SEQUENCE OF Extension
+        set t [call derTlv ${payload} ${fo}]
         set exts_end [expr {${fo} + [lindex ${t} 1] + [lindex ${t} 2]}]
         set fo [expr {${fo} + [lindex ${t} 1]}]
         set iter 0
         while { ${fo} < ${exts_end} && [incr iter] <= $static::ja4x_max_ext } {
-            set et [call derTlv ${payload} ${fo}]      ;# Extension ::= SEQUENCE
+            set et [call derTlv ${payload} ${fo}]
             set ext_inner [expr {${fo} + [lindex ${et} 1]}]
             set fo        [expr {${fo} + [lindex ${et} 1] + [lindex ${et} 2]}]
-            ## first element of the Extension is the extnID OBJECT IDENTIFIER
             set ot      [call derTlv ${payload} ${ext_inner}]
             set oid_off [expr {${ext_inner} + [lindex ${ot} 1]}]
             set oid_len [lindex ${ot} 2]
-            ## Bound the extnID read exactly as in parseName (cap length, keep within buffer).
             if { ${oid_len} >= 1 && ${oid_len} <= 64 && ${oid_off} + ${oid_len} <= ${plen} } {
                 binary scan ${payload} @${oid_off}H[expr {${oid_len} * 2}] oidhex
                 lappend ext_oids ${oidhex}
@@ -210,33 +185,32 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
         set rlen ${plen}
     }
 
-    ## HEADERS - SKIP: record header(5) + hs header(4) + server_version(2) + random(32) = 43
+    ## Skip record header(5) + hs header(4) + server_version(2) + random(32) = 43
     set field_offset 43
     if { ${field_offset} >= ${rlen} } { return "" }
 
-    ## SESSION ID - SKIP
+    ## Session ID - skip
     binary scan ${payload} @${field_offset}c sessID_len
     if { ![info exists sessID_len] } { return "" }
     set sessID_len [expr {${sessID_len} & 0xff}]
     set field_offset [expr {${field_offset} + 1 + ${sessID_len}}]
     if { ${field_offset} + 2 > ${rlen} } { return "" }
 
-    ## SERVER CIPHER
+    ## Server cipher
     binary scan ${payload} @${field_offset}H4 ja4s_cipher
     if { ![info exists ja4s_cipher] || [string length ${ja4s_cipher}] != 4 } { return "" }
     set field_offset [expr {${field_offset} + 2}]
 
-    ## COMPRESSION METHOD - SKIP (single byte)
+    ## Compression method - skip
     if { ${field_offset} + 1 > ${rlen} } { return "" }
     set field_offset [expr {${field_offset} + 1}]
 
-    ## EXTENSIONS
+    ## Extensions
     set ja4s_ecnt 0
     set ja4s_etype_list [list]
     set ja4s_alpn "00"
 
     if { ${field_offset} + 2 <= ${rlen} } {
-        ## Extensions length
         binary scan ${payload} @${field_offset}S extList_len
         set extList_len [expr {${extList_len} & 0xffff}]
         set field_offset [expr {${field_offset} + 2}]
@@ -247,7 +221,7 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
         while { ${field_offset} + 4 <= ${ext_end} } {
             if { [incr ext_iter] > $static::ja4s_max_iter } { break }
 
-            ## Read the extension type as both an int (for the GREASE test) and hex.
+            ## extension type as both int (GREASE test) and hex
             binary scan ${payload} @${field_offset}S@${field_offset}H4 ext_int ext
             if { ![info exists ext] || [string length ${ext}] != 4 } { break }
             set ext_int [expr {${ext_int} & 0xffff}]
@@ -259,7 +233,7 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
 
             if { ${field_offset} + ${ext_len} > ${ext_end} } { break }
 
-            ## Ignore GREASE extension types - they are not counted or hashed.
+            ## ignore GREASE extension types
             if { ! (( ${ext_int} & 0x0f0f ) == 0x0a0a
                     && (( ${ext_int} >> 8 ) & 0xff) == ( ${ext_int} & 0xff )) } {
                 lappend ja4s_etype_list ${ext}
@@ -267,8 +241,7 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
 
                 switch $ext {
                     "0010" {
-                        ## ALPN (16): ext data = 2-byte protocol-list length, then a
-                        ## 1-byte name length, then the name (list length unused).
+                        ## ALPN: 2-byte list length, 1-byte name length, then the name
                         if { ${ext_len} >= 3 } {
                             binary scan ${payload} @[expr {${field_offset} + 2}]c alpn_str_len
                             set alpn_str_len [expr {${alpn_str_len} & 0xff}]
@@ -282,8 +255,7 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
                         }
                     }
                     "002b" {
-                        ## Supported Versions (43) - in a ServerHello this is a single
-                        ## 2-byte selected_version with NO list/length prefix (RFC 8446).
+                        ## Supported Versions: single 2-byte selected_version in a ServerHello
                         if { ${ext_len} >= 2 } {
                             binary scan ${payload} @${field_offset}H4 ja4s_ver
                         }
@@ -296,8 +268,7 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
     }
 
     if { [info exists alpn_str] && [string length ${alpn_str}] > 0 } {
-        ## Spec: first/last ASCII-alphanumeric chars of the ALPN; if either the
-        ## first or last byte is non-alphanumeric, use the hex representation.
+        ## ALPN value = first/last alphanumeric chars, else the hex representation
         set first_byte [scan [string index ${alpn_str} 0]   %c]
         set last_byte  [scan [string index ${alpn_str} end] %c]
         set first_ok [expr {
@@ -318,8 +289,7 @@ proc parseServerHello { payload rlen ja4s_ver ja4s_tprt } {
     if { $ja4s_ecnt > 99 } { set ja4s_ecnt 99 }
     set ja4s_ecnt [format "%02d" $ja4s_ecnt]
 
-    ## JA4S keeps server extensions in their ORIGINAL order (do NOT sort, unlike
-    ## the JA4 client hash).
+    ## JA4S keeps server extensions in their ORIGINAL order (do not sort)
     set ja4s_etype_str ""
     foreach ext_type_hex $ja4s_etype_list {
         append ja4s_etype_str "${ext_type_hex},"
@@ -361,14 +331,12 @@ when SERVER_CONNECTED {
 when SERVER_DATA {
     set plen [TCP::payload length]
 
-    ## ---- ServerHello -> JA4S ------------------------------------------------------------
+    ## ---- ServerHello -> JA4S ----
     if { ![info exists sh_total] } {
         if { ${plen} < 11 } { TCP::collect 11 ; return }
         binary scan [TCP::payload] cH4ScH6H4 rtype proto_ver rlen hs_type rilen server_ver
         set rtype    [expr {${rtype}    & 0xff}]
         set hs_type  [expr {${hs_type}  & 0xff}]
-        ## Total ServerHello record size (record body + 5-byte record header). The JA4S
-        ## parser uses absolute offsets whose base (43) already counts the record header.
         set sh_total [expr {(${rlen} & 0xffff) + 5}]
         if { !( ${rtype} == 22 && ${hs_type} == 2 ) || ${sh_total} > $static::ja4s_max_record } {
             TCP::release
@@ -383,9 +351,7 @@ when SERVER_DATA {
         }
     }
 
-    ## ---- Certificate -> JA4X ------------------------------------------------------------
-    ## The Certificate record follows the ServerHello record (a full handshake). On a
-    ## resumed session there is no Certificate, so this simply never fires.
+    ## ---- Certificate -> JA4X (absent on resumed sessions) ----
     if { ${collect_ja4x} && ![info exists ja4x] } {
         set coff ${sh_total}
         if { ${plen} < [expr {${coff} + 6}] } { TCP::collect [expr {${coff} + 6}] ; return }
@@ -394,15 +360,12 @@ when SERVER_DATA {
         set hs2_type [expr {${hs2_type} & 0xff}]
         set r2len    [expr {${r2len}    & 0xffff}]
         if { ${r2type} == 22 && ${hs2_type} == 11 } {
-            ## Buffer the leaf cert. The leaf is at the start of the Certificate message,
-            ## so collecting the first Certificate record (capped) covers it.
             set need [expr {${coff} + 5 + ${r2len}}]
             if { ${need} > [expr {${coff} + 5 + $static::ja4x_max_cert}] } {
                 set need [expr {${coff} + 5 + $static::ja4x_max_cert}]
             }
             if { ${plen} < ${need} } { TCP::collect ${need} ; return }
-            ## Parse under catch: a hostile or truncated certificate must never abort the
-            ## SERVER_DATA event (which would RST the flow). On any parse error, skip JA4X.
+            ## Parse under catch so a hostile/truncated certificate can never reset the flow.
             if { [catch { call parseServerCert [TCP::payload] ${coff} } ja4x] } {
                 unset -nocomplain ja4x
             } else {
